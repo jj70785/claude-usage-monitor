@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller (work dirs + onedir output; keep build/*.py, *.spec, *.iss)
+build/ClaudeUsageMonitor/
+build/_work/
+build/*/
+dist/
+*.spec.bak
+
+# Inno Setup output
+installer_output/
+Output/
+
+# local runtime
+*.log
+
+# throwaway preview/screenshot images (docs/*.png are tracked normally)
+*_shot.png
+*_preview.png
