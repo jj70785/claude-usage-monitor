@@ -126,7 +126,7 @@ class App:
         self.live = False
         self.pinned = self.prefs.window_pinned
         self._window_shown_once = False
-        self._notifier = ThresholdNotifier()
+        self._notifier = ThresholdNotifier(sender=self._send_alert)
 
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -135,6 +135,8 @@ class App:
         self._commands: "queue.Queue" = queue.Queue()
         self._last_ui_tick = 0.0
         self._refreshing = False
+        self._refreshing_since = 0.0
+        self._tray_checked = False
 
         # The Tk root IS the main pop-out window. Starts hidden.
         self.root = tk.Tk(className=config.LINUX_ID)
@@ -159,7 +161,7 @@ class App:
         cmd = self._commands.put
         self.tray = Tray(
             [(p.id, p.title) for p in self.providers],
-            on_open=lambda pid: cmd(("open", pid)),
+            on_open=lambda pid, anchor=None: cmd(("open", (pid, anchor))),
             on_refresh=lambda: cmd(("refresh", None)),
             on_toggle_login=lambda: cmd(("toggle_login", None)),
             on_quit=lambda: cmd(("quit", None)),
@@ -192,7 +194,8 @@ class App:
     def _worker(self):
         while not self._stop.is_set():
             manual = self._manual.is_set()
-            self._manual.clear()
+            if manual:
+                self._manual.clear()
             now = time.monotonic()
             for st in self.states.values():
                 if self._stop.is_set():
@@ -237,13 +240,35 @@ class App:
     def request_refresh(self):
         if self._refreshing:
             return
+        if any(st.fetching for st in self.states.values()):
+            # A check is already running (e.g. the startup fetch): wait for it rather
+            # than spending a second request right after it.
+            self._begin_refreshing()
+            self.root.after(500, self._await_inflight)
+            return
         if not any(st.ready() for st in self.states.values()):
             self._update_button()
             return
-        self._refreshing = True
-        self._set_refresh_button(False, "Refreshing…")
+        self._begin_refreshing()
         self._manual.set()
         self._wake.set()
+
+    def _begin_refreshing(self):
+        self._refreshing = True
+        self._refreshing_since = time.monotonic()
+        self._set_refresh_button(False, "Refreshing…")
+
+    def _end_refreshing(self):
+        self._refreshing = False
+        self._update_button()
+
+    def _await_inflight(self):
+        if not self._refreshing:
+            return
+        if any(st.fetching for st in self.states.values()):
+            self.root.after(500, self._await_inflight)
+        else:
+            self._end_refreshing()
 
     def set_live(self, on: bool):
         self.live = on
@@ -275,9 +300,19 @@ class App:
             self._set_refresh_button(False, f"Wait {wait}s")
 
     def _button_tick(self):
+        if self._refreshing and time.monotonic() - self._refreshing_since > 180:
+            config.log("refresh watchdog: clearing a stuck 'Refreshing…' state")
+            self._end_refreshing()
         self._update_button()
         if not self._stop.is_set():
             self.root.after(1000, self._button_tick)
+
+    def _send_alert(self, title: str, message: str, urgency: str) -> None:
+        if sys.platform == "win32":
+            self.tray.notify(message or title, title)    # pystray balloon; never an empty body
+        else:
+            from . import notify
+            notify.send(title, message, urgency)
 
     # --------------------------------------------------------------- views
     def _views(self) -> list[ProviderView]:
@@ -323,11 +358,12 @@ class App:
 
     def _handle_command(self, cmd: str, arg):
         if cmd == "open":                       # tray left-click: toggle the flyout
+            _pid, anchor = arg if isinstance(arg, tuple) else (arg, None)
             if self.flyout.is_visible():
                 self.flyout.hide()
             else:
                 self._update_views()
-                self.flyout.show()
+                self.flyout.show(anchor)
                 self._refresh_if_old()
         elif cmd == "show_window":
             self.show_window()
@@ -349,8 +385,7 @@ class App:
 
     def _handle_result(self, kind: str, pid: Optional[str], payload) -> bool:
         if kind == "manual_done":
-            self._refreshing = False
-            self._update_button()
+            self._end_refreshing()
             return False
         st = self.states.get(pid)
         if kind in ("ok", "peek"):
@@ -361,8 +396,7 @@ class App:
                 pcts = ", ".join(f"{m.key}={m.percent:.0f}" for m in snap.meters)
                 config.log(f"{pid} ok via {snap.source}: {pcts}")
             save_snapshots(self.snapshots)
-            if not snap.is_stale(config.STALE_AFTER_SEC):
-                self._notifier.check(snap, self.prefs)
+            self._notifier.check(snap, self.prefs)
         elif kind == "rate":
             retry = payload if isinstance(payload, int) and payload > 0 else 300
             config.log(f"{pid} rate limited, retry_after={retry}")
@@ -379,29 +413,46 @@ class App:
 
     # --------------------------------------------------------------- window
     def show_window(self):
+        was_visible = self.root.state() == "normal"
         self.root.deiconify()
         self.root.attributes("-topmost", self.pinned)
         self.window_panel.set_pinned(self.pinned)
         self._apply_dark_titlebar()
         self.root.update_idletasks()
         # Position only (never a fixed size), so the window grows with more providers.
-        if self.prefs.window_geometry:
-            try:
-                self.root.geometry(self.prefs.window_geometry)
-            except tk.TclError:
-                pass
-        elif not self._window_shown_once:
-            w = self.root.winfo_reqwidth() or 352
-            h = self.root.winfo_reqheight() or 480
-            x = max(0, (self.root.winfo_screenwidth() - w) // 2)
-            y = max(0, (self.root.winfo_screenheight() - h) // 3)
-            self.root.geometry(f"+{x}+{y}")
+        if not was_visible:
+            saved = self._saved_position()
+            if saved:
+                self.root.geometry(saved)
+            elif not self._window_shown_once:
+                w = self.root.winfo_reqwidth() or 352
+                h = self.root.winfo_reqheight() or 480
+                x = max(0, (self.root.winfo_screenwidth() - w) // 2)
+                y = max(0, (self.root.winfo_screenheight() - h) // 3)
+                self.root.geometry(f"+{x}+{y}")
         self._window_shown_once = True
         self.root.lift()
         self.root.focus_force()
         self._refresh_if_old()
 
+    def _saved_position(self) -> str:
+        """The remembered '+X+Y', unless it would put the window (mostly) off-screen,
+        e.g. after unplugging the monitor it was on."""
+        geo = self.prefs.window_geometry
+        try:
+            _, xs, ys = geo.split("+")
+            x, y = int(xs), int(ys)
+        except (ValueError, AttributeError):
+            return ""
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        if x < -100 or y < -20 or x > sw - 80 or y > sh - 60:
+            return ""
+        return f"+{x}+{y}"
+
     def hide_window(self):
+        if not self._tray_ok():
+            self.shutdown()                    # no tray to come back from: closing = quitting
+            return
         try:
             self.prefs.window_geometry = "+" + "+".join(self.root.geometry().split("+")[1:])
             self.prefs.save()
@@ -475,7 +526,23 @@ class App:
         self.root.after(1000, self._button_tick)
         if self._show_on_start:
             self.root.after(80, self.show_window)
+        self.root.after(6000, self._check_tray)
         self.root.mainloop()
+
+    def _tray_ok(self) -> bool:
+        avail = getattr(self.tray, "available", None)
+        return True if avail is None else avail() is not False
+
+    def _check_tray(self):
+        """If no tray icon could be shown (no GTK, Wayland, no tray host), the window is
+        the only way in and out: show it, and give it a Quit button."""
+        if self._tray_ok():
+            return
+        config.log("no visible tray icon; falling back to the window")
+        self.status = "No system tray found — closing this window quits the app"
+        self.window_panel.enable_quit(self.shutdown)
+        self._update_views()
+        self.show_window()
 
     def shutdown(self):
         self._stop.set()

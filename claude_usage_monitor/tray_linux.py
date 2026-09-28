@@ -46,6 +46,9 @@ class Tray:
         self._login_item = None
         self._menu = None
         self._syncing = False
+        self._failed = False
+        self._Pixbuf = None
+        self._GLibMod = None
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -55,21 +58,43 @@ class Tray:
 
     def _run(self) -> None:
         try:
-            import gi
-            gi.require_version("Gtk", "3.0")
-            gi.require_version("GdkPixbuf", "2.0")
-            from gi.repository import GdkPixbuf, GLib, Gtk
-        except (ImportError, ValueError) as e:
-            config.log(f"tray: GTK unavailable ({e}); install python3-gi and gir1.2-gtk-3.0")
+            try:
+                import gi
+                gi.require_version("Gtk", "3.0")
+                gi.require_version("GdkPixbuf", "2.0")
+                from gi.repository import GdkPixbuf, GLib, Gtk
+            except (ImportError, ValueError) as e:
+                config.log(f"tray: GTK unavailable ({e}); install python3-gi and gir1.2-gtk-3.0")
+                self._failed = True
+                return
+            warnings.filterwarnings("ignore", category=DeprecationWarning)   # StatusIcon is deprecated in GTK 3
+            self._menu = None
+            try:
+                self._Pixbuf, self._GLibMod = GdkPixbuf, GLib
+                self._Gtk = Gtk
+                self._menu = self._build_menu()
+                for pid, title in self._providers:
+                    self._make_icon(pid, title)
+            except Exception as e:
+                config.log(f"tray: GTK setup failed: {type(e).__name__}: {e}")
+                self._failed = True
+                return
+            self._GLib = GLib                           # publish only once GTK is ready
+        finally:
             self._ready.set()
-            return
-        self._Gtk, self._GLib, self._Pixbuf = Gtk, GLib, GdkPixbuf
-        warnings.filterwarnings("ignore", category=DeprecationWarning)   # StatusIcon is deprecated in GTK 3
-        self._menu = self._build_menu()
-        for pid, title in self._providers:
-            self._make_icon(pid, title)
-        self._ready.set()
         Gtk.main()
+
+    def available(self) -> "bool | None":
+        """True once an icon is actually embedded in a tray; False if GTK failed or no
+        icon got embedded (Wayland, no tray host); None while it's too early to tell."""
+        if self._failed:
+            return False
+        if not self._ready.is_set() or not self._icons:
+            return None
+        try:
+            return any(icon.is_embedded() for icon in self._icons.values())
+        except Exception:
+            return None
 
     def stop(self) -> None:
         if self._GLib and self._Gtk:
@@ -88,13 +113,30 @@ class Tray:
         icon = Gtk.StatusIcon()
         icon.set_name(f"{config.LINUX_ID}-{pid}")
         icon.set_title(f"{config.APP_NAME} — {title}")
-        icon.connect("activate", lambda _i, p=pid: self._cb_open(p))
+        icon.connect("activate", lambda i, p=pid: self._cb_open(p, self._anchor(i)))
         icon.connect("popup-menu", self._on_popup)
         icon.connect("size-changed", lambda _i, size, p=pid: self._on_size(p, size))
         self._icons[pid] = icon
         self._sizes[pid] = 32
         self._paint(pid, None, "", False)
         icon.set_visible(True)
+
+    def _anchor(self, icon) -> "dict | None":
+        """Where the clicked icon is, and the work area of the monitor it's on, so the
+        flyout opens next to it on the right screen (Tk only knows the whole X screen)."""
+        try:
+            ok, screen, rect, orient = icon.get_geometry()
+            if not ok:
+                return None
+            display = screen.get_display()
+            monitor = display.get_monitor_at_point(rect.x + rect.width // 2, rect.y + rect.height // 2)
+            wa = monitor.get_workarea()
+            return {"icon": (rect.x, rect.y, rect.width, rect.height),
+                    "workarea": (wa.x, wa.y, wa.width, wa.height),
+                    "vertical": orient == self._Gtk.Orientation.VERTICAL}
+        except Exception as e:
+            config.log(f"tray: couldn't read icon geometry: {e}")
+            return None
 
     def _on_size(self, pid: str, size: int) -> bool:
         if size > 0:
@@ -104,7 +146,7 @@ class Tray:
         return True
 
     def _pixbuf(self, img):
-        GLib, Pix = self._GLib, self._Pixbuf
+        GLib, Pix = self._GLibMod, self._Pixbuf
         img = img.convert("RGBA")
         w, h = img.size
         return Pix.Pixbuf.new_from_bytes(GLib.Bytes.new(img.tobytes()), Pix.Colorspace.RGB, True, 8, w, h, w * 4)
@@ -129,7 +171,7 @@ class Tray:
             mi.connect("activate", lambda _w: cb())
             menu.append(mi)
 
-        item("Quick view", lambda: self._cb_open(""))
+        item("Quick view", lambda: self._cb_open("", None))
         item("Open window", self._cb_open_window)
         item("Refresh now", self._cb_refresh)
         menu.append(Gtk.SeparatorMenuItem())

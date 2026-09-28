@@ -140,6 +140,16 @@ class UsagePanel:
                 command=self._refresh_clicked,
             )
         self.refresh_btn.pack(side="left")
+        self._controls = controls
+        self._quit_btn = None
+
+    def enable_quit(self, on_quit: Callable[[], None]):
+        """Add a Quit button (used when there is no tray menu to quit from)."""
+        if self._quit_btn is None:
+            self._quit_btn = tk.Button(self._controls, text="Quit", font=self._f(10), relief="flat",
+                                       bg=TRACK, fg=FG, activebackground="#4a4b4f", activeforeground=FG,
+                                       bd=0, padx=12, pady=5, cursor="hand2", command=on_quit)
+            self._quit_btn.pack(side="left", padx=(8, 0))
 
     def _refresh_clicked(self):
         if self._refresh_enabled:
@@ -216,15 +226,19 @@ class UsagePanel:
                 r = self._rows.get((v.provider_id, m.key))
                 if not r:
                     continue
+                old = m.is_stale(config.STALE_AFTER_SEC)
                 if m.expired:
                     r["pct"].config(text="--", fg=SUB)
                     self._color(r["style"], TRACK)
                     r["bar"].config(value=0)
                 else:
-                    r["pct"].config(text=f"{m.percent:.0f}%", fg=SUB if v.stale else FG)
+                    r["pct"].config(text=f"{m.percent:.0f}%", fg=SUB if old else FG)
                     self._color(r["style"], config.color_for_percent(m.percent))
                     r["bar"].config(value=min(max(m.percent, 0), 100))
-                r["reset"].config(text=m.reset_text())
+                reset = m.reset_text()
+                if old and m.as_of and not m.expired:
+                    reset = f"{reset} · as of {age_text(m.as_of)}" if reset else f"as of {age_text(m.as_of)}"
+                r["reset"].config(text=reset, fg=WARN_FG if old and not m.expired else SUB)
         self.status.config(text=status)
 
     def _color(self, style: str, color: str):

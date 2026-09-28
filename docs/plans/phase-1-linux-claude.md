@@ -39,13 +39,19 @@ Out of scope: Codex, Gemini, multiple accounts, Windows/macOS re-testing (phases
 | `config.py` | XDG paths, rotating log, Linux autostart, new prefs |
 | `tray.py`, `tray_macos.py` | Ported to the one-icon-per-provider API (**untested** on those OSes) |
 | `auth.py`, `usage_api.py` | **Deleted** (token refresh, cookie path, keyring) |
-| `tools/rate_test.py` | Moved; now refuses to run without `--i-understand` |
-| `tests/test_claude.py` | **New.** 29 unit tests, including a fake `claude` CLI |
+| `rate_test.py` | **Deleted** (hammered the endpoint; impersonated Claude Code) |
+| `tests/test_claude.py` | **New.** 44 unit tests, including a fake `claude` CLI |
 
 ## Verification done (2026-09-28)
 
-- `python3 -m unittest discover -s tests`: 29 tests pass, including under
+- `python3 -m unittest discover -s tests`: 44 tests pass, including under
   `-W error::ResourceWarning`.
+- A six-lens code review (concurrency, provider logic, subprocess, security/privacy, UI,
+  cross-platform), with every finding checked by a skeptical verifier: 35 confirmed
+  findings, all medium/low, all fixed (known-issues R1–R20) except the pre-existing
+  Windows installer autostart issue (O10, Phase 2).
+- Live: `get_usage` answers from Claude Code's saved snapshot first and refreshes it about
+  1 s later. The app waits for that refresh, so a check shows data "just now".
 - `python3 probe.py`: live read through Claude Code in about 1.3 s: Max 5x, 5-hour,
   weekly, and "Weekly · Fable" limits.
 - The direct API with the honest User-Agent returned HTTP 200.

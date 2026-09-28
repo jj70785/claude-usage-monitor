@@ -22,10 +22,19 @@ numbers.
 - Read `cachedUsageUtilization` and the status-line drop file in `peek()`, re-reading a
   file only when its mtime changes.
 - **Newest wins, per limit.** A local value replaces what's shown only if its timestamp
-  is newer than that limit's `as_of`.
-- The status-line hook records **when Claude Code last got a response** (the
-  transcript's mtime), not the redraw time, and it refuses to overwrite a newer
-  observation from another session.
+  is newer than that limit's `as_of`. A status-line row is never *added* to a snapshot
+  that is newer than the status-line observation.
+- **Age is tracked per limit.** One fresh row (say, the status line's session number)
+  can't make an hours-old per-model row look current: stale rows get "as of …" in amber,
+  the icon grays when the number it shows is old, and alerts never fire on old numbers.
+- The status-line hook records **when Claude Code last got a real model response**: the
+  timestamp of the last non-synthetic, non-error assistant entry in the transcript. It
+  doesn't use the redraw time or the transcript's mtime, which `/model`, `/clear`, or a
+  submitted prompt also bump. With no response yet in the session, it writes nothing, and
+  it refuses to overwrite a newer observation from another session.
+- **Future timestamps are rejected** (anything more than 10 s ahead of now: clock steps,
+  dual-boot RTC skew), because they would win every "newest" comparison and never go stale.
+- Malformed drop files are ignored, and the optional overlay can never sink a good fetch.
 - Limits whose `resets_at` has passed are shown as "reset — waiting for fresh data" and
   ignored for the icon.
 - Data older than 20 minutes is shown as "as of …" in amber, and the icon is grayed.

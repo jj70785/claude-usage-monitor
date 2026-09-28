@@ -158,6 +158,13 @@ def _source_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def launch_argv() -> list[str]:
+    """argv that starts this app: the packaged exe, or python + run.py from source."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, os.path.join(_source_root(), "run.py")]
+
+
 def launch_command(tray_only: bool) -> str:
     """Command line that starts this app (packaged exe, or python + run.py from source)."""
     flag = " --tray" if tray_only else ""
@@ -178,7 +185,8 @@ def _autostart_file() -> str:
 
 def desktop_entry(tray_only: bool) -> str:
     from . import linux_desktop
-    return linux_desktop.desktop_entry(launch_command(tray_only), autostart=tray_only)
+    return linux_desktop.desktop_entry(linux_desktop.exec_line(launch_argv() + (["--tray"] if tray_only else [])),
+                                       autostart=tray_only)
 
 
 def set_run_on_login(enabled: bool) -> bool:

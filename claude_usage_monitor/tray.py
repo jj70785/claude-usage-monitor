@@ -57,7 +57,7 @@ class Tray:
             worst = snap.worst() if snap else None
             try:
                 icon.icon = ring_image(worst.percent if worst else None, pid, 64, stale.get(pid, False))
-                icon.title = tooltip(snap, titles[pid], notes.get(pid, ""))[:_TIP_MAX]
+                icon.title = tooltip(snap, titles[pid], notes.get(pid, ""), max_len=_TIP_MAX)
             except Exception as e:
                 config.log(f"tray update failed: {e}")
 

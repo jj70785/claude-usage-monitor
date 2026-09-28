@@ -34,7 +34,12 @@ enqueue commands for the Tk thread. `pystray` is now used on Windows only.
 - Linux needs `python3-gi` and `gir1.2-gtk-3.0` (preinstalled on most Debian desktops)
   plus `python3-tk`. No pip packages.
 - **X11 only.** On Wayland, `Gtk.StatusIcon` doesn't show. A StatusNotifierItem (SNI)
-  backend is on the roadmap.
+  backend is on the roadmap. Meanwhile the app checks, 6 s after start, whether any icon
+  actually got embedded. If none did (no GTK, Wayland, no tray host), it opens the window
+  with a **Quit** button, and closing the window quits.
+- The icon's own geometry and its monitor's work area are passed to the flyout, so it
+  opens next to the clicked icon on the right monitor (Tk alone only knows the whole X
+  screen).
 - XFCE draws XEmbed icons on an opaque square (same as nm-applet, Notes, and Clipman).
   Cosmetic; SNI would fix it too.
 - GTK logs one harmless `Gdk-CRITICAL … thaw_toplevel_updates` line at startup (see

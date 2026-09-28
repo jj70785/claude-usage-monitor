@@ -38,8 +38,8 @@ class ThresholdNotifier:
         if not prefs.notify_on_warn:
             return
         for m in snap.live_meters():
-            if not m.primary:
-                continue
+            if not m.primary or m.is_stale(config.STALE_AFTER_SEC):
+                continue                     # never alert on an old number
             window = m.resets_at.isoformat() if m.resets_at else ""
             for level, threshold in (("critical", prefs.crit_threshold), ("warning", prefs.warn_threshold)):
                 if m.percent < threshold:

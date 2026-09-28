@@ -25,6 +25,8 @@ several accounts of each), right in the tray, without a browser tab.
   keeps a console from flashing.
 - Status-line drop file: the hook writes `~/.cache/ai-usage-monitor/…` on every OS; confirm
   Windows resolves `~` to `%USERPROFILE%`.
+- Installer autostart: make HKCU `Run` the only mechanism (drop the `{userstartup}`
+  shortcut, delete it on upgrade), so the tray toggle reflects reality (known issue O10).
 - Rebuild with PyInstaller (the spec no longer collects `keyring`) and Inno Setup; update
   names ("AI Usage Monitor") while keeping the `ClaudeUsageMonitor` settings folder, so
   upgrades keep their prefs.

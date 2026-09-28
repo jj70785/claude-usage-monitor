@@ -11,16 +11,44 @@ update the moment you get a response, at zero cost, and covers the case where `g
 ever breaks.
 
 **Staleness:** the status line only gets new numbers after a model response. The hook
-records *when that response happened* (the transcript's modification time), not when the
-line was redrawn. The monitor only uses the numbers if they're newer than what it already
-has ([decision 0008](decisions/0008-local-sources-and-freshness.md)). A Claude Code window
+records *when that response happened* (the timestamp of the last real assistant entry in
+the session transcript), not when the line was redrawn or the transcript was last touched
+(which also happens on `/model`, `/clear`, or a submitted prompt). With no response yet in
+the session, it writes nothing. The monitor only uses the numbers if they're newer than
+what it already has ([decision 0008](decisions/0008-local-sources-and-freshness.md)). A Claude Code window
 left idle for days can't push old numbers.
 
 ## Add it
 
-1. Paste this function into your status-line script (Python), above `main()`:
+1. Paste these two functions into your status-line script (Python), above `main()`:
 
 ```python
+def _last_response_ms(transcript_path):
+    """When Claude Code last got a real model response in this session (epoch ms), or
+    None. Read from the transcript's tail: its mtime also changes on /model, /clear,
+    submitted prompts, etc., which would make old numbers look new."""
+    try:
+        with open(transcript_path, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 262144))
+            tail = f.read().decode('utf-8', 'replace').splitlines()
+        for line in reversed(tail):
+            if '"assistant"' not in line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if (e.get('type') != 'assistant' or e.get('isApiErrorMessage')
+                    or (e.get('message') or {}).get('model') == '<synthetic>'):
+                continue
+            ts = e.get('timestamp')
+            if ts:
+                return int(datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() * 1000)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
 def save_plan_usage(input_data):
     """Save the 5-hour/weekly plan usage Claude Code passes to this script, so AI Usage
     Monitor (github.com/jj70785/claude-usage-monitor) can use it as a free backup source.
@@ -29,17 +57,17 @@ def save_plan_usage(input_data):
         rl = input_data.get('rate_limits')
         if not isinstance(rl, dict) or not rl:
             return
-        # When Claude Code last got a response in this session: an idle session keeps
-        # redrawing old numbers, so the redraw time would lie about freshness.
         tp = input_data.get('transcript_path')
-        observed_ms = int((os.path.getmtime(tp) if tp and os.path.exists(tp) else datetime.now().timestamp()) * 1000)
+        observed_ms = _last_response_ms(tp) if tp else None
+        if not observed_ms:
+            return          # no model response in this session yet: the numbers may be old
         base = os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache')
         path = os.path.join(base, 'ai-usage-monitor', 'claude-statusline.json')
         try:
             with open(path, encoding='utf-8') as f:
-                if json.load(f).get('observed_at', 0) > observed_ms:
-                    return          # another session already saved something newer
-        except (OSError, ValueError):
+                if json.load(f).get('observed_at', 0) >= observed_ms:
+                    return  # already saved (or another session saved something newer)
+        except (OSError, ValueError, AttributeError):
             pass
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"

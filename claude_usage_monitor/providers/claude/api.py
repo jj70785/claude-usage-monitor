@@ -29,6 +29,18 @@ USER_AGENT = f"ai-usage-monitor/{__version__} (+https://github.com/jj70785/claud
 _SSL_CTX = ssl.create_default_context()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib copies the Authorization header onto redirects, to any host and even
+    https -> http. A usage GET has no business being redirected, so treat any 3xx as
+    an error instead of forwarding Claude Code's token."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=_SSL_CTX))
+
+
 def _retry_after(value: Optional[str]) -> Optional[int]:
     """Retry-After as delta-seconds or an HTTP-date."""
     if not value:
@@ -53,7 +65,7 @@ def fetch(login: LoginInfo) -> dict:
         "Accept": "application/json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=config.HTTP_TIMEOUT_SEC, context=_SSL_CTX) as r:
+        with _OPENER.open(req, timeout=config.HTTP_TIMEOUT_SEC) as r:
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):

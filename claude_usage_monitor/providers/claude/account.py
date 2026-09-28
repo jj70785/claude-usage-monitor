@@ -24,36 +24,62 @@ TIER_LABELS = {
 PLAN_LABELS = {"max": "Max", "pro": "Pro", "team": "Team", "enterprise": "Enterprise", "free": "Free"}
 
 
+# Variables that would make a `claude` child report something other than this plan's
+# usage: API-key or third-party-cloud backends, an inference-only setup-token, and markers
+# a parent Claude Code session leaves in the environment of anything it launches.
+_SCRUB_ENV = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID",
+)
+
+
+def normalize_dir(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    return os.path.abspath(os.path.expanduser(path)).rstrip(os.sep) or os.sep
+
+
 @dataclass
 class ClaudeAccount:
-    """One Claude Code login. `config_dir=None` means the default (~/.claude)."""
+    """One Claude Code login.
+
+    `config_dir=None` means "the ambient account": whatever `claude` would use when run
+    from this environment, i.e. $CLAUDE_CONFIG_DIR if set, else ~/.claude. Every path and
+    the child process's environment go through `effective_dir`, so the files we read and
+    the account `claude` reports on can never disagree.
+    """
     config_dir: Optional[str] = None
 
     @property
+    def effective_dir(self) -> Optional[str]:
+        return normalize_dir(self.config_dir) or normalize_dir(os.environ.get("CLAUDE_CONFIG_DIR"))
+
+    @property
     def home(self) -> str:
-        return self.config_dir or os.path.join(os.path.expanduser("~"), ".claude")
+        return self.effective_dir or os.path.join(os.path.expanduser("~"), ".claude")
 
     def credentials_path(self) -> str:
-        # CLAUDE_SECURESTORAGE_CONFIG_DIR relocates just the credentials file.
+        # CLAUDE_SECURESTORAGE_CONFIG_DIR relocates just the credentials file (ambient account only).
         secure = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR") if self.config_dir is None else None
-        return os.path.join(secure or self.home, ".credentials.json")
+        return os.path.join(normalize_dir(secure) or self.home, ".credentials.json")
 
     def state_path(self) -> str:
         """Claude Code's app-state file: ~/.claude.json by default, <dir>/.claude.json otherwise."""
-        if self.config_dir:
-            return os.path.join(self.config_dir, ".claude.json")
+        if self.effective_dir:
+            return os.path.join(self.effective_dir, ".claude.json")
         return os.path.join(os.path.expanduser("~"), ".claude.json")
 
     def env(self) -> dict:
         """Environment for a `claude` child process that should act as this account."""
         env = dict(os.environ)
-        # An API key in the environment would make Claude Code bill the API instead of
-        # reporting plan usage; nesting markers from a parent Claude Code session can
-        # change CLI behavior. Neither belongs in a usage probe.
-        for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
+        for k in _SCRUB_ENV:
             env.pop(k, None)
-        if self.config_dir:
-            env["CLAUDE_CONFIG_DIR"] = self.config_dir
+        if self.effective_dir:
+            env["CLAUDE_CONFIG_DIR"] = self.effective_dir
+        else:
+            env.pop("CLAUDE_CONFIG_DIR", None)
         return env
 
 
@@ -84,25 +110,32 @@ def plan_label(subscription: str, tier: str = "") -> str:
     return PLAN_LABELS.get(sub, sub.title())
 
 
+def _keychain_blob(account: ClaudeAccount) -> Optional[dict]:
+    """macOS: Claude Code keeps credentials in the Keychain. Only the default account's
+    service name ('Claude Code-credentials') is known for sure; other config dirs use a
+    suffixed name, so they are skipped until Phase 3 verifies the rule on a Mac."""
+    if sys.platform != "darwin" or account.effective_dir:
+        return None
+    try:
+        out = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return json.loads(out.stdout.strip()).get("claudeAiOauth")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def _read_blob(account: ClaudeAccount) -> Optional[dict]:
     path = account.credentials_path()
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f).get("claudeAiOauth")
-        except (OSError, ValueError):
+                blob = json.load(f).get("claudeAiOauth")
+            return blob if isinstance(blob, dict) else None
+        except (OSError, ValueError, AttributeError):
             return None
-    if sys.platform == "darwin":
-        # Claude Code keeps macOS credentials in the Keychain. Named per config dir; the
-        # default account uses the plain service name. (Untested here; see docs/plans.)
-        try:
-            out = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-                                 capture_output=True, text=True, timeout=10)
-            if out.returncode == 0 and out.stdout.strip():
-                return json.loads(out.stdout.strip()).get("claudeAiOauth")
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return None
-    return None
+    return _keychain_blob(account)
 
 
 def read_login(account: ClaudeAccount) -> LoginInfo:

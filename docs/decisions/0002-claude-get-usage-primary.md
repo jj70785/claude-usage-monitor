@@ -45,11 +45,19 @@ the pref `claude_api_fallback`), then the newest local snapshot (0008).
 - **Empty working directory + `--setting-sources project` + `--strict-mcp-config`:** no
   project hooks, no `.mcp.json` servers, no user MCP servers get started.
 - **Not `--bare`.** It looks faster, but it disables OAuth, so usage becomes unavailable.
-- **`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are removed** from the child's
-  environment, so Claude Code reports plan usage instead of switching to API billing.
 - **Only our `control_response` line is parsed**; stdout is never logged, and stderr only
   contributes a truncated first line to error messages.
-- 45-second timeout, then kill.
+- **Environment scrubbed** of variables that would switch Claude Code to another backend or
+  an inference-only token: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`/`_VERTEX`/`_FOUNDRY`, plus the markers a
+  parent Claude Code session leaves behind. `CLAUDE_CONFIG_DIR` is set to the account's
+  effective config dir, the same one whose files we read.
+- **45-second timeout, then return; never SIGKILL.** A `get_usage` call can include Claude
+  Code's own token refresh, and killing it mid-refresh could lose a freshly rotated
+  refresh token (0001). The process is handed to a background reaper that waits 90 s,
+  then sends SIGTERM to its process group (only while it's still running), and never
+  force-kills. Reader threads own and close their pipes, so a leftover helper process
+  can't block the worker.
 
 ## Consequences
 
@@ -60,10 +68,20 @@ the pref `claude_api_fallback`), then the newest local snapshot (0008).
   `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET`). Every failure is treated as
   normal and falls through to the fallbacks; the parser tolerates missing and unknown
   fields.
-- The reply has no freshness flag. When the server rate-limits Claude Code, it answers
-  from its saved snapshot (up to about an hour old). We detect that by checking whether
-  Claude Code rewrote `cachedUsageUtilization` during our call; if not, we label the data
-  with the snapshot's age (0008).
+- **It answers from its saved snapshot first.** Observed 2026-09-28 (2.1.284): if its
+  `cachedUsageUtilization` is under 60 s old, the reply *is* that snapshot. If it's older
+  (up to about an hour), the reply is still the saved copy, returned at once, and Claude
+  Code fetches live and rewrites the snapshot about 1 s later, even after we close stdin.
+  So after a reply we check the snapshot's timestamp. If it wasn't just written, we wait
+  up to 4 s for the refreshed snapshot and use that (full `limits[]`, real timestamp). If
+  none arrives (e.g. the server rate-limited Claude Code), we show the saved copy labeled
+  with its age (0008).
+- A reply with `rate_limits_available: false` means the login has no plan usage (API key,
+  setup-token, cloud backend) → "not logged in" hint. `rate_limits: null` with
+  availability true means Claude Code couldn't reach the server and has no recent
+  snapshot → a normal error that falls through to the backups.
+- A reply that parses to zero limits (e.g. a renamed field after an update) counts as a
+  failure, so the app keeps the last good snapshot instead of blanking the display.
 - Each check starts a Claude Code process for about 1–2 s. At the default 5-minute
   interval that's negligible.
 - Multi-account support later is just `CLAUDE_CONFIG_DIR=<dir>` in the child's

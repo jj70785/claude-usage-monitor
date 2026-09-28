@@ -10,9 +10,9 @@
 | Settings | `$XDG_CONFIG_HOME/ai-usage-monitor/prefs.json` (+ `monitor.log`) | `%APPDATA%\ClaudeUsageMonitor\` / `~/Library/Application Support/ClaudeUsageMonitor/` |
 | Cache | `$XDG_CACHE_HOME/ai-usage-monitor/` (`last_snapshots.json`, `claude-probe/`) | same folder as settings |
 | Status-line drop file | `$XDG_CACHE_HOME/ai-usage-monitor/claude-statusline.json` | the **same** `~/.cache/…` path, so one status-line script works everywhere |
-| Start on login | `~/.config/autostart/ai-usage-monitor.desktop` (tray menu toggle) | HKCU `Run` value (Windows); not yet on macOS |
+| Start on login | `~/.config/autostart/ai-usage-monitor.desktop` (tray menu toggle); `Exec=` escaped per the Desktop Entry spec, so paths with spaces, `%`, quotes, or `$` work | HKCU `Run` value (Windows); not yet on macOS |
 | App menu entry | `python3 -m claude_usage_monitor --install` → `~/.local/share/applications/ai-usage-monitor.desktop` | Inno Setup shortcuts (Windows) |
-| Single instance | Unix socket `$XDG_RUNTIME_DIR/ai-usage-monitor.sock` (mode 0600; stale sockets from a crash are detected and replaced) | loopback TCP port 49219 (Windows) |
+| Single instance | Unix socket `$XDG_RUNTIME_DIR/ai-usage-monitor.sock` (mode 0600; stale sockets from a crash are detected and replaced). Without `XDG_RUNTIME_DIR`, `~/.cache/ai-usage-monitor/instance.sock` (dir 0700), never a shared `/tmp` name another user could squat | loopback TCP port 49219 (Windows) |
 | Log | rotating, 512 KB × 3 | same |
 
 ## Why

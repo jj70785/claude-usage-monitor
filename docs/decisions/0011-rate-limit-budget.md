@@ -21,8 +21,10 @@ public issues show `retry-after: 0` and sticky 429s), so we stay conservative.
 - **Opening the flyout or window no longer forces a fetch.** v1 spent a request on every
   peek; now it fetches only if the newest data is older than 90 s.
 - Local sources (0008) are free and polled every 10 s.
-- `tools/rate_test.py`, which deliberately triggers a 429, now refuses to run without
-  `--i-understand`.
+- v1's `tools/rate_test.py`, which deliberately triggered a 429 (and still impersonated
+  Claude Code's User-Agent), was **deleted**. Its results live on in `config.py` and here.
+- A Refresh click while a check is already running joins that check instead of queueing
+  a second request right after it.
 
 ## Consequences
 

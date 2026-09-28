@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -31,6 +32,7 @@ from ..base import NotLoggedIn, ProviderError
 from .account import ClaudeAccount
 
 TIMEOUT_SEC = 45
+REAP_GRACE_SEC = 90       # >= Claude Code's own 30 s token request plus lock waits
 
 _CANDIDATES = [
     "~/.local/bin/claude",
@@ -64,19 +66,61 @@ def _scratch_dir() -> str:
 
 
 def _reader(stream, q: "queue.Queue[Optional[str]]"):
+    """Pump lines into `q`. The reader owns its stream and closes it at EOF: another
+    thread closing a stream this thread is blocked reading would deadlock on the
+    buffer lock (e.g. when a leftover helper process still holds the pipe)."""
     try:
         for line in iter(stream.readline, ""):
             q.put(line)
     except (OSError, ValueError):
         pass
     finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
         q.put(None)
+
+
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    """Signal the child's whole process group (it leads its own session on POSIX).
+    Only called while the leader is still running, so the group ID is still ours."""
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, sig)
+        else:
+            proc.terminate()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """Let a slow `claude` finish on its own; if it truly hangs, ask it to stop.
+
+    Never SIGKILL: a get_usage call can include Claude Code's own token refresh (lock wait
+    plus a 30 s token request), and killing it mid-refresh could lose a freshly rotated
+    refresh token, which logs Claude Code out (docs/decisions/0001).
+    """
+    try:
+        proc.wait(timeout=REAP_GRACE_SEC)
+    except subprocess.TimeoutExpired:
+        config.log("claude usage probe still running after grace period; sending SIGTERM")
+        _signal_group(proc, signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            config.log("claude usage probe ignored SIGTERM; leaving it alone")
+    # No group signal after the leader has exited: its ID could in theory be reused by
+    # an unrelated process. Leftover helpers only keep a daemon reader thread waiting.
 
 
 def get_usage(account: ClaudeAccount, claude_path: str) -> dict:
     """Return the get_usage payload ({subscription_type, rate_limits_available, rate_limits, ...}).
 
-    Raises NotLoggedIn / ProviderError.
+    Raises NotLoggedIn / ProviderError. Returns as soon as the reply (or the timeout)
+    arrives; the child process is then closed and reaped on a background thread.
     """
     request_id = f"aum-{uuid.uuid4().hex[:12]}"
     cmd = [
@@ -88,7 +132,7 @@ def get_usage(account: ClaudeAccount, claude_path: str) -> dict:
                     cwd=_scratch_dir(), env=account.env(), text=True, encoding="utf-8",
                     errors="replace", bufsize=1)
     if os.name == "posix":
-        popen_kw["start_new_session"] = True      # no controlling TTY, no stray signals
+        popen_kw["start_new_session"] = True      # no controlling TTY; its own process group
     else:
         popen_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
@@ -98,10 +142,8 @@ def get_usage(account: ClaudeAccount, claude_path: str) -> dict:
 
     out_q: "queue.Queue[Optional[str]]" = queue.Queue()
     err_q: "queue.Queue[Optional[str]]" = queue.Queue()
-    readers = [threading.Thread(target=_reader, args=(proc.stdout, out_q), daemon=True),
-               threading.Thread(target=_reader, args=(proc.stderr, err_q), daemon=True)]
-    for t in readers:
-        t.start()
+    for stream, q in ((proc.stdout, out_q), (proc.stderr, err_q)):
+        threading.Thread(target=_reader, args=(stream, q), name="claude-probe-io", daemon=True).start()
 
     req = {"type": "control_request", "request_id": request_id,
            "request": {"subtype": "get_usage", "skip_behaviors": True}}
@@ -113,6 +155,7 @@ def get_usage(account: ClaudeAccount, claude_path: str) -> dict:
 
     deadline = time.monotonic() + TIMEOUT_SEC
     reply = None
+    exited = False
     try:
         while time.monotonic() < deadline:
             try:
@@ -120,6 +163,7 @@ def get_usage(account: ClaudeAccount, claude_path: str) -> dict:
             except queue.Empty:
                 break
             if line is None:               # stdout closed: process exited
+                exited = True
                 break
             line = line.strip()
             if not line.startswith("{"):
@@ -128,51 +172,44 @@ def get_usage(account: ClaudeAccount, claude_path: str) -> dict:
                 msg = json.loads(line)
             except ValueError:
                 continue
-            if msg.get("type") != "control_response":
+            if not isinstance(msg, dict) or msg.get("type") != "control_response":
                 continue
             resp = msg.get("response") or {}
-            if resp.get("request_id") != request_id:
+            if not isinstance(resp, dict) or resp.get("request_id") != request_id:
                 continue
             reply = resp
             break
     finally:
-        _finish(proc)
-        for t in readers:
-            t.join(timeout=2)
-        for stream in (proc.stdout, proc.stderr):
-            try:
-                stream.close()
-            except OSError:
-                pass
+        try:
+            proc.stdin.close()             # EOF lets claude exit cleanly
+        except OSError:
+            pass
+        threading.Thread(target=_reap, args=(proc,), name="claude-probe-reap", daemon=True).start()
 
     if reply is None:
+        if exited:
+            try:
+                proc.wait(timeout=2)       # let the exit code and stderr land
+            except subprocess.TimeoutExpired:
+                pass
         err = _first_error_line(err_q)
-        if proc.returncode not in (None, 0) and err:
+        if exited and err:
             raise _classify(err)
-        raise ProviderError("Claude Code didn't answer the usage request"
+        if not exited:
+            raise ProviderError(f"Claude Code didn't answer within {TIMEOUT_SEC} s")
+        raise ProviderError("Claude Code exited without answering the usage request"
                             + (f" ({err})" if err else ""))
     if reply.get("subtype") != "success":
         raise _classify(str(reply.get("error") or "usage request failed"))
     payload = reply.get("response") or {}
-    if not payload.get("rate_limits_available") or not isinstance(payload.get("rate_limits"), dict):
-        raise NotLoggedIn("Claude Code has no plan usage to report — is it logged in with a Pro/Max plan?")
+    if not isinstance(payload, dict) or not payload.get("rate_limits_available"):
+        raise NotLoggedIn("Claude Code has no plan usage for this login — "
+                          "it needs a claude.ai Pro/Max login (not an API key or cloud backend)")
+    if not isinstance(payload.get("rate_limits"), dict):
+        # Available in principle, but Claude Code couldn't reach the usage server and has
+        # no recent snapshot (e.g. a long 429 lockout). Not a login problem; fall back.
+        raise ProviderError("Claude Code couldn't reach the usage server and has no recent snapshot")
     return payload
-
-
-def _finish(proc: subprocess.Popen) -> None:
-    try:
-        if proc.stdin and not proc.stdin.closed:
-            proc.stdin.close()             # EOF lets claude exit cleanly
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=8)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            pass
 
 
 def _first_error_line(err_q: "queue.Queue[Optional[str]]") -> str:
@@ -190,8 +227,12 @@ def _first_error_line(err_q: "queue.Queue[Optional[str]]") -> str:
     return lines[0][:160] if lines else ""
 
 
+_LOGIN_WORDS = ("not logged in", "logged out", "please run /login", "run /login", "login expired",
+                "invalid api key", "oauth token", "authentication", "unauthorized", "invalid_grant")
+
+
 def _classify(message: str) -> ProviderError:
     low = message.lower()
-    if "login" in low or "logged" in low or "auth" in low or "credential" in low:
+    if any(w in low for w in _LOGIN_WORDS):
         return NotLoggedIn(f"Claude Code: {message[:160]}")
     return ProviderError(f"Claude Code: {message[:160]}")

@@ -68,17 +68,20 @@ def ring_image(percent: Optional[float], provider_id: str = "", size: int = 64,
     if percent is None:
         text, fg = "–", NO_DATA
     else:
-        p = max(0.0, float(percent))
+        p = float(percent)
+        if p != p:                          # NaN
+            p = 0.0
+        p = max(0.0, p)
         color = _hex_to_rgb(config.color_for_percent(p))
         if stale:
             gray = sum(color) // 3
             color = tuple(int(c * 0.25 + gray * 0.35) for c in color)   # grayed out = old data
         if p > 0:
             d.arc(box, -90, -90 + min(p, 100.0) / 100.0 * 360, fill=color + (255,), width=width)
-        text = "!!" if p >= 100 else f"{p:.0f}"
+        text = "!!" if p >= 100 else str(min(99, int(round(p))))   # never "100" before the limit
         fg = (240, 240, 244) if not stale else (175, 175, 180)
 
-    font_px = int(s * (0.40 if len(text) <= 2 else 0.32))
+    font_px = int(s * 0.40)
     font = _font(font_px)
     bbox = d.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]

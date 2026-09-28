@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import socket
-import tempfile
 from typing import Optional
 
 from . import config
@@ -18,10 +17,18 @@ _LOCK_PORT = 49219
 
 
 def _sock_path() -> str:
-    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    name = f"{config.LINUX_ID}.sock" if os.environ.get("XDG_RUNTIME_DIR") else f"{config.LINUX_ID}-{uid}.sock"
-    return os.path.join(base, name)
+    """$XDG_RUNTIME_DIR (private per user). Without it (su/sudo sessions, some non-systemd
+    setups), use our own cache dir, never a shared /tmp name that another local user
+    could squat to stop the app from starting."""
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    if rt and os.path.isdir(rt):
+        return os.path.join(rt, f"{config.LINUX_ID}.sock")
+    d = config.cache_dir()
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return os.path.join(d, "instance.sock")
 
 
 def acquire() -> Optional[socket.socket]:

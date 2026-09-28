@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from typing import Optional
 
 from ... import config
-from ...model import Meter, parse_dt
-from .account import ClaudeAccount
+from ...model import Meter, parse_dt, utcnow
+from .account import ClaudeAccount, normalize_dir
 from .parse import SESSION_LABEL, WEEKLY_LABEL, meters_from_rate_limits
 
 STATUSLINE_FILE = "claude-statusline.json"
@@ -49,6 +50,16 @@ class _MtimeCache:
 
 _cache = _MtimeCache()
 
+# A timestamp from the future (clock stepped back after the write, RTC in local time on a
+# dual-boot machine, ...) would win every "newest" comparison and never go stale.
+_FUTURE_SLACK = timedelta(seconds=10)
+
+
+def _plausible(ts: Optional[datetime]) -> Optional[datetime]:
+    if ts is None or ts > utcnow() + _FUTURE_SLACK:
+        return None
+    return ts
+
 
 def claude_snapshot(account: ClaudeAccount) -> tuple[Optional[datetime], list[Meter]]:
     """Claude Code's cached usage: (fetched_at, meters), or (None, [])."""
@@ -58,8 +69,28 @@ def claude_snapshot(account: ClaudeAccount) -> tuple[Optional[datetime], list[Me
     snap = data.get("cachedUsageUtilization")
     if not isinstance(snap, dict):
         return None, []
-    as_of = parse_dt(snap.get("fetchedAtMs"))
+    as_of = _plausible(parse_dt(snap.get("fetchedAtMs")))
+    if as_of is None:
+        return None, []
     return as_of, meters_from_rate_limits(snap.get("utilization") or {}, as_of)
+
+
+def wait_for_fresh_snapshot(account: ClaudeAccount, newer_than: Optional[datetime],
+                            timeout: float) -> tuple[Optional[datetime], list[Meter]]:
+    """Wait (briefly) for Claude Code to write a snapshot newer than `newer_than`.
+
+    Observed 2026-09-28 (Claude Code 2.1.284): when its saved snapshot is over 60 s old,
+    get_usage answers from that saved copy right away, then fetches live and rewrites
+    the snapshot about a second later, even after we've closed stdin.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        at, meters = claude_snapshot(account)
+        if at and meters and (newer_than is None or at > newer_than):
+            return at, meters
+        if time.monotonic() >= deadline:
+            return None, []
+        time.sleep(0.25)
 
 
 def statusline_path() -> str:
@@ -79,10 +110,12 @@ def statusline_meters(account: ClaudeAccount) -> tuple[Optional[datetime], list[
     data = _cache.read_json(statusline_path())
     if not isinstance(data, dict):
         return None, []
-    if (data.get("config_dir") or None) != (account.config_dir or None):
+    if normalize_dir(data.get("config_dir")) != account.effective_dir:
         return None, []
-    observed = parse_dt(data.get("observed_at"))
-    rl = data.get("rate_limits") or {}
+    observed = _plausible(parse_dt(data.get("observed_at")))
+    rl = data.get("rate_limits")
+    if observed is None or not isinstance(rl, dict):
+        return None, []
     meters = []
     for field, key, label in (("five_hour", "session", SESSION_LABEL), ("seven_day", "weekly", WEEKLY_LABEL)):
         w = rl.get(field)

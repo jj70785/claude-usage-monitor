@@ -48,17 +48,29 @@ class TempHome(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = self.tmp.name
-        env = {"HOME": self.home, "XDG_CACHE_HOME": os.path.join(self.home, ".cache"),
+        # HOME for POSIX, USERPROFILE/APPDATA for Windows (expanduser ignores HOME there).
+        env = {"HOME": self.home, "USERPROFILE": self.home, "APPDATA": os.path.join(self.home, "AppData"),
+               "XDG_CACHE_HOME": os.path.join(self.home, ".cache"),
                "XDG_CONFIG_HOME": os.path.join(self.home, ".config")}
-        self._env = mock.patch.dict(os.environ, env)
-        self._env.start()
+        self._patches = [
+            mock.patch.dict(os.environ, env),
+            # Never touch the network or a real macOS Keychain from a test.
+            mock.patch("urllib.request.urlopen", side_effect=AssertionError("network in tests")),
+            mock.patch.object(api._OPENER, "open", side_effect=AssertionError("network in tests")),
+            mock.patch("claude_usage_monitor.providers.claude.account._keychain_blob", return_value=None),
+            mock.patch.object(cli_usage, "REAP_GRACE_SEC", 2),
+            mock.patch("claude_usage_monitor.providers.claude.SNAPSHOT_WAIT_SEC", 0.6),
+        ]
+        for pt in self._patches:
+            pt.start()
         for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
             os.environ.pop(k, None)
         os.makedirs(os.path.join(self.home, ".claude"), exist_ok=True)
         local._cache = local._MtimeCache()
 
     def tearDown(self):
-        self._env.stop()
+        for pt in reversed(self._patches):
+            pt.stop()
         self.tmp.cleanup()
 
     def write_creds(self, **over):
@@ -160,10 +172,28 @@ class AccountTests(TempHome):
         acct = ClaudeAccount(config_dir="/x/claude-work")
         self.assertEqual(acct.credentials_path(), "/x/claude-work/.credentials.json")
         self.assertEqual(acct.state_path(), "/x/claude-work/.claude.json")
-        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-should-not-leak"}):
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k", "CLAUDE_CODE_OAUTH_TOKEN": "t",
+                                          "CLAUDE_CODE_USE_BEDROCK": "1", "ANTHROPIC_BASE_URL": "http://x"}):
             env = acct.env()
-        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BASE_URL"):
+            self.assertNotIn(k, env)
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/x/claude-work")
+
+    def test_ambient_config_dir_is_used_everywhere(self):
+        """An inherited CLAUDE_CONFIG_DIR must move the files we read AND the child's account."""
+        d = os.path.join(self.home, "claude-alt")
+        os.makedirs(d)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d + "/"}):
+            acct = ClaudeAccount()
+            self.assertEqual(acct.credentials_path(), os.path.join(d, ".credentials.json"))
+            self.assertEqual(acct.state_path(), os.path.join(d, ".claude.json"))
+            self.assertEqual(acct.env()["CLAUDE_CONFIG_DIR"], d)
+            with open(os.path.join(d, ".credentials.json"), "w") as f:
+                json.dump({"claudeAiOauth": {"accessToken": "t", "expiresAt": int((time.time() + 999) * 1000),
+                                             "subscriptionType": "pro"}}, f)
+            self.assertEqual(read_login(acct).state, "fresh")
+            self.write_statusline(utcnow(), config_dir=d)
+            self.assertEqual(len(local.statusline_meters(acct)[1]), 2)
 
 
 # --------------------------------------------------------------------------- cli protocol
@@ -215,13 +245,40 @@ print(json.dumps({"type": "control_response", "response": {"subtype": "error", "
         with self.assertRaises(NotLoggedIn):
             cli_usage.get_usage(ClaudeAccount(), crash)
 
-    def test_timeout_kills_hung_cli(self):
+    def test_timeout_returns_promptly_without_killing(self):
         path = self.fake_claude("import time\ntime.sleep(60)\n")
         with mock.patch.object(cli_usage, "TIMEOUT_SEC", 1.5):
             t = time.monotonic()
             with self.assertRaises(ProviderError):
                 cli_usage.get_usage(ClaudeAccount(), path)
-            self.assertLess(time.monotonic() - t, 15)
+            self.assertLess(time.monotonic() - t, 4)          # reaping happens in the background
+
+    def test_leftover_helper_holding_pipes_does_not_block(self):
+        """A helper that inherits stdout must not hold up a successful reply."""
+        path = self.fake_claude(f"RL = json.loads({json.dumps(json.dumps(RATE_LIMITS))})\n" + """
+import subprocess
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(8)"])   # inherits our pipes
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"type": "control_response", "response": {"subtype": "success",
+      "request_id": req["request_id"], "response": {"rate_limits_available": True, "rate_limits": RL}}}), flush=True)
+""")
+        t = time.monotonic()
+        cli_usage.get_usage(ClaudeAccount(), path)
+        self.assertLess(time.monotonic() - t, 4)
+
+    def test_null_rate_limits_is_not_a_login_problem(self):
+        path = self.fake_claude("""
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"type": "control_response", "response": {"subtype": "success", "request_id": req["request_id"],
+      "response": {"rate_limits_available": True, "rate_limits": None}}}), flush=True)
+""")
+        with self.assertRaises(ProviderError) as cm:
+            cli_usage.get_usage(ClaudeAccount(), path)
+        self.assertNotIsInstance(cm.exception, NotLoggedIn)
+
+    def test_classify_is_not_fooled_by_substrings(self):
+        self.assertNotIsInstance(cli_usage._classify("author field missing"), NotLoggedIn)
+        self.assertIsInstance(cli_usage._classify("Not logged in · Please run /login"), NotLoggedIn)
 
     def test_runs_in_scratch_dir_with_safe_flags(self):
         path = self.fake_claude("""
@@ -253,6 +310,11 @@ class ApiTests(unittest.TestCase):
             with self.assertRaises(NotLoggedIn):
                 api.fetch(LoginInfo("stale", access_token="t"))
             op.assert_not_called()
+
+    def test_redirects_are_not_followed(self):
+        handlers = [type(h) for h in api._OPENER.handlers]
+        self.assertIn(api._NoRedirect, handlers)
+        self.assertIsNone(api._NoRedirect().redirect_request(None, None, 302, "", {}, "http://evil"))
 
     def test_honest_user_agent(self):
         self.assertTrue(api.USER_AGENT.startswith("ai-usage-monitor/"))
@@ -290,14 +352,34 @@ class ProviderTests(TempHome):
         self.assertIn("last check", snap.note)
         self.assertTrue(snap.is_stale(config.STALE_AFTER_SEC))
 
+    def test_uses_snapshot_claude_writes_right_after_answering(self):
+        """Claude Code answers from an old saved copy, then writes a live one ~1 s later."""
+        import threading
+        self.write_creds()
+        self.write_claude_state(utcnow() - timedelta(minutes=5), rate_limits=RATE_LIMITS)
+        live = json.loads(json.dumps(RATE_LIMITS))
+        live["limits"][0]["percent"] = 91
+        prov = self.provider(claude_api_fallback=False)
+
+        def answer_then_refresh(acct, path):
+            threading.Timer(0.3, lambda: self.write_claude_state(utcnow(), rate_limits=live)).start()
+            return {"rate_limits_available": True, "rate_limits": RATE_LIMITS}   # the old copy
+        with mock.patch.object(cli_usage, "find_claude", return_value="/bin/true"), \
+                mock.patch.object(cli_usage, "get_usage", side_effect=answer_then_refresh):
+            snap = prov.fetch()
+        self.assertEqual({m.key: m.percent for m in snap.meters}["session"], 91)
+        self.assertEqual(snap.note, "")
+        self.assertFalse(snap.is_stale(config.STALE_AFTER_SEC))
+
     def test_falls_back_to_api_then_never_refreshes(self):
         self.write_creds(expiresAt=int((time.time() - 5) * 1000))    # stale token
         prov = self.provider(claude_api_fallback=True)
         with mock.patch.object(cli_usage, "find_claude", return_value=None), \
-                mock.patch("urllib.request.urlopen") as op:
+                mock.patch.object(api._OPENER, "open") as op, mock.patch("urllib.request.urlopen") as uo:
             with self.assertRaises(ProviderError):
                 prov.fetch()
             op.assert_not_called()          # stale token: no request, and certainly no refresh
+            uo.assert_not_called()
 
     def test_api_fallback_used_when_cli_fails(self):
         self.write_creds()
@@ -348,6 +430,70 @@ class ProviderTests(TempHome):
         self.write_statusline(now - timedelta(days=3), five=5, week=10)   # idle session, 3 days old
         self.assertIsNone(prov.peek())
 
+    def test_empty_parse_falls_through_to_api(self):
+        self.write_creds()
+        prov = self.provider(claude_api_fallback=True)
+        with mock.patch.object(cli_usage, "find_claude", return_value="/bin/true"), \
+                mock.patch.object(cli_usage, "get_usage", return_value={
+                    "rate_limits_available": True, "rate_limits": {"usage_v2": {"x": 1}}}), \
+                mock.patch.object(api, "fetch", return_value=RATE_LIMITS):
+            snap = prov.fetch()
+        self.assertEqual(snap.source, "api")
+
+    def test_all_sources_empty_keeps_last_good_snapshot(self):
+        self.write_creds()
+        prov = self.provider(claude_api_fallback=False)
+        good = Snapshot("claude", "Claude", meters=meters_from_rate_limits(RATE_LIMITS, utcnow()), fetched_at=utcnow())
+        prov.seed(good)
+        with mock.patch.object(cli_usage, "find_claude", return_value="/bin/true"), \
+                mock.patch.object(cli_usage, "get_usage", return_value={
+                    "rate_limits_available": True, "rate_limits": {"renamed": {}}}):
+            with self.assertRaises(ProviderError):
+                prov.fetch()
+        self.assertIs(prov.latest, good)
+
+    def test_answer_from_old_snapshot_keeps_per_model_rows(self):
+        self.write_creds()
+        self.write_claude_state(utcnow() - timedelta(minutes=40))      # full limits[] on disk
+        legacy_only = {k: v for k, v in RATE_LIMITS.items() if k != "limits"}
+        prov = self.provider(claude_api_fallback=False)
+        with mock.patch.object(cli_usage, "find_claude", return_value="/bin/true"), \
+                mock.patch.object(cli_usage, "get_usage", return_value={
+                    "rate_limits_available": True, "rate_limits": legacy_only}):
+            snap = prov.fetch()
+        self.assertIn("weekly:Fable", [m.key for m in snap.meters])
+
+    def test_old_statusline_row_not_inserted_into_newer_snapshot(self):
+        self.write_creds()
+        prov = self.provider()
+        now = utcnow()
+        weekly_only = [m for m in meters_from_rate_limits(RATE_LIMITS, now) if m.key != "session"]
+        prov.seed(Snapshot("claude", "Claude", meters=weekly_only, fetched_at=now))
+        self.write_statusline(now - timedelta(days=3), five=5, week=10)
+        self.assertIsNone(prov.peek())
+
+    def test_future_and_malformed_drop_files_ignored(self):
+        self.write_statusline(utcnow() + timedelta(hours=2))
+        self.assertEqual(local.statusline_meters(ClaudeAccount()), (None, []))
+        with open(local.statusline_path(), "w") as f:
+            json.dump({"observed_at": int(time.time() * 1000), "config_dir": None, "rate_limits": [1, 2]}, f)
+        local._cache = local._MtimeCache()
+        self.assertEqual(local.statusline_meters(ClaudeAccount()), (None, []))
+        # ...and a malformed file never sinks a good live fetch
+        self.write_creds()
+        prov = self.provider(claude_api_fallback=False)
+        with mock.patch.object(cli_usage, "find_claude", return_value="/bin/true"), \
+                mock.patch.object(cli_usage, "get_usage", return_value={
+                    "rate_limits_available": True, "rate_limits": RATE_LIMITS}):
+            self.assertEqual(prov.fetch().worst().percent, 78)
+
+    def test_stale_per_model_row_grays_the_icon(self):
+        now = utcnow()
+        snap = Snapshot("claude", "Claude", fetched_at=now, meters=[
+            Meter("session", "5h", 5, now + timedelta(hours=1), as_of=now, primary=True),
+            Meter("weekly:Fable", "Fable", 85, now + timedelta(days=2), as_of=now - timedelta(days=3))])
+        self.assertTrue(snap.is_stale(config.STALE_AFTER_SEC))    # the 85% on the icon is 3 days old
+
     def test_statusline_for_other_account_ignored(self):
         self.write_statusline(utcnow(), config_dir="/somewhere/else")
         self.assertEqual(local.statusline_meters(ClaudeAccount()), (None, []))
@@ -363,7 +509,7 @@ class NotifierTests(unittest.TestCase):
 
         def snap(p):
             return Snapshot("claude", "Claude", meters=[Meter("session", "5-hour session", p, resets_at=reset,
-                                                              primary=True)])
+                                                              as_of=utcnow(), primary=True)])
         n.check(snap(50), prefs)
         n.check(snap(81), prefs)
         n.check(snap(85), prefs)
@@ -372,8 +518,35 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual([u for _, u in sent], ["normal", "critical"])
         prefs.notify_on_warn = False
         n.check(Snapshot("claude", "Claude", meters=[Meter("session", "x", 99, resets_at=reset + timedelta(hours=5),
-                                                           primary=True)]), prefs)
+                                                           as_of=utcnow(), primary=True)]), prefs)
         self.assertEqual(len(sent), 2)
+
+    def test_never_alerts_on_old_numbers(self):
+        sent = []
+        n = ThresholdNotifier(sender=lambda t, m, u: sent.append(t))
+        old = Meter("session", "5-hour session", 99, resets_at=utcnow() + timedelta(hours=1),
+                    as_of=utcnow() - timedelta(hours=3), primary=True)
+        n.check(Snapshot("claude", "Claude", meters=[old]), config.Prefs())
+        self.assertEqual(sent, [])
+
+
+class MiscTests(unittest.TestCase):
+    def test_windows_tooltip_budget_keeps_note_and_primaries(self):
+        from claude_usage_monitor.model import tooltip
+        now = utcnow()
+        snap = Snapshot("claude", "Claude", plan="Max 5x", fetched_at=now, meters=[
+            Meter("session", "5-hour session", 68, now + timedelta(hours=2), as_of=now, primary=True),
+            Meter("weekly", "Weekly · all models", 80, now + timedelta(days=2), as_of=now, primary=True),
+            Meter("weekly:Fable", "Weekly · Fable", 12, now + timedelta(days=2), as_of=now)])
+        t = tooltip(snap, "Claude", "Rate limited — trying again in 5 min", max_len=127)
+        self.assertLessEqual(len(t), 127)
+        for must in ("5-hour session: 68%", "Weekly · all models: 80%", "Rate limited", "updated"):
+            self.assertIn(must, t)
+
+    def test_desktop_exec_escaping(self):
+        from claude_usage_monitor.linux_desktop import exec_line
+        self.assertEqual(exec_line(["/a b/100%/x"]), '"/a b/100%%/x"')
+        self.assertEqual(exec_line(['/q"$`']), '"/q\\\\"\\\\$\\\\`"')
 
 
 if __name__ == "__main__":

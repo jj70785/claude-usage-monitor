@@ -64,6 +64,12 @@ class Meter:
         """The window has reset since we measured it, so the number is known-wrong."""
         return bool(self.resets_at and self.resets_at <= utcnow())
 
+    def is_stale(self, max_age_sec: int) -> bool:
+        """Measured too long ago to present as current (or age unknown)."""
+        if self.as_of is None:
+            return True
+        return (utcnow() - self.as_of).total_seconds() > max_age_sec
+
     def level(self) -> str:
         if self.severity in ("normal", "warning", "critical"):
             return self.severity
@@ -140,6 +146,14 @@ class Snapshot:
         return max(live, key=lambda m: m.percent) if live else None
 
     def is_stale(self, max_age_sec: int) -> bool:
+        """True when the number the tray icon shows is old.
+
+        `fetched_at` is the newest data in the snapshot; one fresh row (say, the status
+        line's session number) must not make an hours-old per-model row look current.
+        """
+        worst = self.worst()
+        if worst is not None:
+            return worst.is_stale(max_age_sec)
         if not self.fetched_at:
             return True
         return (utcnow() - self.fetched_at).total_seconds() > max_age_sec
@@ -162,21 +176,56 @@ class Snapshot:
         )
 
 
-def tooltip(snap: Optional[Snapshot], title: str, note: str = "") -> str:
-    """Multi-line hover text for a provider's tray icon."""
+def _clip(text: str, n: int) -> str:
+    return text if len(text) <= n else text[: max(0, n - 1)] + "…"
+
+
+def tooltip(snap: Optional[Snapshot], title: str, note: str = "", max_len: Optional[int] = None,
+            stale_after_sec: Optional[int] = None) -> str:
+    """Multi-line hover text for a provider's tray icon.
+
+    With `max_len` (Windows tray tooltips hold 128 characters), whole lines are kept in
+    priority order instead of cutting mid-line: title, note, age, primary limits,
+    then the rest.
+    """
+    stale_after = config.STALE_AFTER_SEC if stale_after_sec is None else stale_after_sec
     head = title if not (snap and snap.plan) else f"{title} · {snap.plan}"
-    lines = [head]
+    extra = note or (snap.note if snap else "")
+    rows: list[tuple[bool, str, str]] = []          # (primary, full line, short line)
+    age = ""
     if snap and snap.meters:
         for m in snap.meters:
             if m.expired:
-                lines.append(f"{m.label}: reset — refreshing")
+                line = f"{m.label}: reset — refreshing"
+                rows.append((m.primary, line, line))
                 continue
+            pct = f"{m.label}: {m.percent:.0f}%"
             rt = m.reset_text()
-            lines.append(f"{m.label}: {m.percent:.0f}%" + (f" · {rt}" if rt else ""))
-        lines.append(f"updated {age_text(snap.fetched_at)}")
+            old = f" (as of {age_text(m.as_of)})" if m.is_stale(stale_after) and m.as_of else ""
+            rows.append((m.primary, pct + (f" · {rt}" if rt else "") + old, pct + old))
+        age = f"updated {age_text(snap.fetched_at)}"
     else:
-        lines.append("no data yet")
-    extra = note or (snap.note if snap else "")
-    if extra:
-        lines.append(extra)
-    return "\n".join(lines)
+        age = "no data yet"
+
+    if max_len is None:
+        return "\n".join([head] + [r[1] for r in rows] + [age] + ([extra] if extra else []))
+
+    fixed = [head] + ([_clip(extra, max_len // 2)] if extra else []) + [age]
+    budget = max_len - len("\n".join(fixed))
+    # Pass 1: short form of every primary limit. Pass 2: upgrade primaries to the full
+    # form (with reset time). Pass 3: short form of the other limits while they fit.
+    chosen: dict[int, str] = {}
+    for i, (primary, _full, short) in enumerate(rows):
+        if primary and len(short) + 1 <= budget:
+            chosen[i] = short
+            budget -= len(short) + 1
+    for i, (primary, full, short) in enumerate(rows):
+        if i in chosen and len(full) - len(short) <= budget:
+            chosen[i] = full
+            budget -= len(full) - len(short)
+    for i, (primary, _full, short) in enumerate(rows):
+        if not primary and len(short) + 1 <= budget:
+            chosen[i] = short
+            budget -= len(short) + 1
+    lines = [head] + [chosen[i] for i in sorted(chosen)] + fixed[1:]
+    return _clip("\n".join(lines), max_len)
