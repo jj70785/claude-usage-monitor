@@ -1,4 +1,6 @@
-pystray>=0.19.5
+# Linux: install your distro's packages instead of pip (PEP 668 blocks pip into system Python):
+#   sudo apt install python3-tk python3-gi gir1.2-gtk-3.0 python3-pil
+# Windows / macOS (pip, ideally in a venv):
+pystray>=0.19.5; sys_platform == "win32"
 Pillow>=10.0.0
-keyring>=24.0.0
 pyobjc-framework-Cocoa; sys_platform == "darwin"

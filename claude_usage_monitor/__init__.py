@@ -1,10 +1,9 @@
-"""Claude Usage Monitor — a lightweight system-tray app that shows your
-claude.ai subscription plan usage (5-hour session window + weekly limit)
-without opening a browser.
+"""AI Usage Monitor — a lightweight tray app that shows your AI subscription plan usage
+(Claude today; Codex and Gemini next) without opening a browser.
 
-Data comes from the (unofficial) endpoint GET https://api.anthropic.com/api/oauth/usage,
-authenticated with the OAuth token that Claude Code stores locally.
+Claude data comes from Claude Code itself (its `get_usage` control request), with
+read-only fallbacks. See docs/README.md.
 """
 
-__version__ = "1.0.0"
-APP_NAME = "Claude Usage Monitor"
+__version__ = "2.0.0.dev0"
+APP_NAME = "AI Usage Monitor"

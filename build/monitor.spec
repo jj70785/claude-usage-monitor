@@ -7,14 +7,13 @@ from PyInstaller.utils.hooks import collect_all
 ROOT = os.path.abspath(os.getcwd())
 
 datas, binaries, hiddenimports = [], [], []
-# pystray + keyring import their platform backends dynamically — collect them all.
-for pkg in ("pystray", "keyring"):
+# pystray imports its platform backend dynamically — collect it all.
+# (keyring is no longer used: the app stores no credentials. See docs/decisions/0004.)
+for pkg in ("pystray",):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
     hiddenimports += h
-# keyring's Windows backend rides on pywin32-ctypes.
-hiddenimports += ["win32ctypes.core", "win32ctypes.pywin32"]
 # bundle the window/taskbar icon for runtime use (config.asset_path -> _MEIPASS/assets)
 datas += [(os.path.join(ROOT, "assets", "icon.ico"), "assets")]
 

@@ -1,58 +1,54 @@
-"""macOS menu-bar icons via native NSStatusItem.
+"""macOS menu-bar icons via native NSStatusItem, one per provider.
 
 pystray's macOS backend calls ``[NSApplication run]`` on a background thread, which
 AppKit only permits on the main thread -> SIGTRAP crash. Instead we create native
 ``NSStatusItem``s on the main thread; tkinter's mainloop already pumps the Cocoa event
-loop, so the status items and their menus work without ``NSApplication.run()`` or any
-extra threads.
+loop, so the status items and their menus work without extra threads.
 
-This module is macOS-only and exposes the SAME ``Tray`` API as ``tray.py`` (the pystray
-implementation used on Windows/Linux): same ``__init__`` callbacks and
-start/stop/update/notify/refresh_menu methods.
+Same public API as tray.py / tray_linux.py.
+
+NOTE: not yet re-tested on macOS after the multi-provider rewrite. See
+docs/plans/roadmap.md (Phase 3: macOS).
 """
 from __future__ import annotations
 
 import io
-from typing import Optional
+from typing import Callable, Optional
 
 from AppKit import (
     NSApplication,
-    NSStatusBar,
-    NSVariableStatusItemLength,
-    NSMenu,
-    NSMenuItem,
-    NSImage,
     NSEventMaskLeftMouseDown,
     NSEventMaskRightMouseDown,
-    NSEventTypeRightMouseDown,
     NSEventModifierFlagControl,
+    NSEventTypeRightMouseDown,
+    NSImage,
+    NSMenu,
+    NSMenuItem,
+    NSStatusBar,
+    NSVariableStatusItemLength,
 )
-from Foundation import NSObject, NSData
+from Foundation import NSData, NSObject
 
-# Reuse the icon renderers + tooltip from the pystray module. Importing tray.py on macOS
-# is safe: pystray only crashes if an icon's .run() is called, which we never do here.
-from .tray import make_bars_image, make_ring_image, _tip
-from .usage_api import Usage
+from . import notify
+from .icons import ring_image
+from .model import Snapshot, tooltip
 
 
 def _nsimage(pil_img, px: int = 18) -> NSImage:
     """Convert a PIL image to a retina NSImage sized for the menu bar."""
-    img = pil_img.resize((px * 2, px * 2))            # retina
+    img = pil_img.resize((px * 2, px * 2))
     buf = io.BytesIO()
     img.save(buf, "PNG")
     raw = buf.getvalue()
-    data = NSData.dataWithBytes_length_(raw, len(raw))
-    ns = NSImage.alloc().initWithData_(data)
+    ns = NSImage.alloc().initWithData_(NSData.dataWithBytes_length_(raw, len(raw)))
     ns.setSize_((px, px))
-    ns.setTemplate_(False)                            # keep our colours (green/yellow/red)
+    ns.setTemplate_(False)                            # keep our colors (green/yellow/red)
     return ns
 
 
 class _Handler(NSObject):
-    """Objective-C target for the status-bar buttons and the menu items.
-    Holds a strong ref to the owning Tray (which has the callbacks + menu)."""
+    """Objective-C target for the status-bar buttons and the menu items."""
 
-    # --- status-bar button click: left = flyout toggle, right/ctrl = menu ---------
     def statusItemClicked_(self, sender):
         event = NSApplication.sharedApplication().currentEvent()
         is_right = False
@@ -61,9 +57,8 @@ class _Handler(NSObject):
                         or bool(event.modifierFlags() & NSEventModifierFlagControl))
         self._tray._handle_button_click(sender, is_right)
 
-    # --- menu items ---------------------------------------------------------------
     def quickView_(self, _):
-        self._tray._cbs["open"]()
+        self._tray._cbs["open"]("")
 
     def openWindow_(self, _):
         self._tray._cbs["open_window"]()
@@ -71,40 +66,34 @@ class _Handler(NSObject):
     def refresh_(self, _):
         self._tray._cbs["refresh"]()
 
-    def pasteKey_(self, _):
-        self._tray._cbs["paste_key"]()
-
     def quitApp_(self, _):
         self._tray._cbs["quit"]()
 
 
 class Tray:
-    def __init__(self, on_open, on_refresh, on_toggle_login, on_quit, on_paste_key, on_open_window):
-        # on_toggle_login is part of the shared API (Windows "Start on login"); unused on macOS.
-        self._cbs = {
-            "open": on_open,
-            "refresh": on_refresh,
-            "quit": on_quit,
-            "paste_key": on_paste_key,
-            "open_window": on_open_window,
-        }
+    def __init__(self, providers: list[tuple[str, str]], *, on_open: Callable[[str], None],
+                 on_refresh: Callable[[], None], on_toggle_login: Callable[[], None],
+                 on_quit: Callable[[], None], on_open_window: Callable[[], None],
+                 is_login_enabled: Callable[[], bool]):
+        # on_toggle_login / is_login_enabled: macOS login items are not implemented yet.
+        self._providers = list(providers)
+        self._cbs = {"open": on_open, "refresh": on_refresh, "quit": on_quit, "open_window": on_open_window}
         self._handler = _Handler.alloc().init()
         self._handler._tray = self                   # strong ref so the target survives
-        self._items: list = []
+        self._items: dict[str, object] = {}          # provider_id -> NSStatusItem
         self._menu_obj = None
 
     def _handle_button_click(self, button, is_right: bool) -> None:
-        """Left-click toggles the flyout (like Windows); right/Control-click shows the menu.
-        The menu is attached to the clicked item only for the duration of the pop-up so
-        plain left-clicks keep firing our action instead of auto-opening the menu."""
+        """Left-click toggles the flyout; right/Control-click shows the menu, attached only
+        for the pop-up so plain left-clicks keep firing our action."""
+        pid, item = next(((p, it) for p, it in self._items.items() if it.button() == button), ("", None))
         if is_right:
-            item = next((it for it in self._items if it.button() == button), None)
             if item is not None:
                 item.setMenu_(self._menu_obj)
                 button.performClick_(None)           # opens the menu, blocks until dismissed
                 item.setMenu_(None)
         else:
-            self._cbs["open"]()
+            self._cbs["open"](pid)
 
     def _menu(self) -> NSMenu:
         m = NSMenu.alloc().init()
@@ -118,54 +107,42 @@ class Tray:
         add("Open window", "openWindow:")
         add("Refresh now", "refresh:")
         m.addItem_(NSMenuItem.separatorItem())
-        add("Paste session key…", "pasteKey:")
         add("Quit", "quitApp:")
         return m
 
     def start(self) -> None:
-        """MUST run on the main thread — it is, since App.run() calls this on main."""
+        """MUST run on the main thread (App.run() calls it there)."""
         bar = NSStatusBar.systemStatusBar()
-        self._menu_obj = self._menu()                # one shared menu, attached on demand
-
-        def wire(button):
-            # Fire our action on BOTH mouse-downs (no permanent menu) so we can route
-            # left -> flyout, right/ctrl -> menu ourselves.
+        self._menu_obj = self._menu()
+        # macOS adds each new status item to the LEFT of existing ones, so create them in
+        # reverse to keep the first provider leftmost.
+        for pid, _title in reversed(self._providers):
+            item = bar.statusItemWithLength_(NSVariableStatusItemLength)
+            button = item.button()
+            button.setImage_(_nsimage(ring_image(None, pid)))
             button.setTarget_(self._handler)
             button.setAction_("statusItemClicked:")
             button.sendActionOn_(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown)
+            self._items[pid] = item
 
-        # macOS adds each new status item to the LEFT of existing ones. Create the weekly
-        # (ring) item first so it ends up on the right, and the 5-hour (bars) item second
-        # so it ends up on the left -> left = bars = 5-hour, right = ring = weekly.
-        week_item = bar.statusItemWithLength_(NSVariableStatusItemLength)
-        week_item.button().setImage_(_nsimage(make_ring_image(None)))
-        wire(week_item.button())
-
-        five_item = bar.statusItemWithLength_(NSVariableStatusItemLength)
-        five_item.button().setImage_(_nsimage(make_bars_image(None)))
-        wire(five_item.button())
-
-        # Logical order for update(): [0] = bars (5-hour), [1] = ring (weekly).
-        self._items = [five_item, week_item]
-
-    def update(self, usage: Optional[Usage], note: str = "") -> None:
-        if not self._items:
-            return
-        five = usage.five_hour if usage else None
-        week = usage.weekly if usage else None
-        self._items[0].button().setImage_(_nsimage(make_bars_image(five.percent if five else None)))
-        self._items[0].button().setToolTip_(_tip("5-hour", five, note))
-        self._items[1].button().setImage_(_nsimage(make_ring_image(week.percent if week else None)))
-        self._items[1].button().setToolTip_(_tip("Weekly", week, note))
+    def update(self, snapshots: dict[str, Optional[Snapshot]], notes: dict[str, str],
+               stale: dict[str, bool]) -> None:
+        titles = dict(self._providers)
+        for pid, item in self._items.items():
+            snap = snapshots.get(pid)
+            worst = snap.worst() if snap else None
+            item.button().setImage_(_nsimage(ring_image(worst.percent if worst else None, pid, 64,
+                                                        stale.get(pid, False))))
+            item.button().setToolTip_(tooltip(snap, titles.get(pid, pid), notes.get(pid, "")))
 
     def notify(self, message: str, title: Optional[str] = None) -> None:
-        pass        # skip native notifications on macOS for now
+        notify.send(title or "AI Usage Monitor", message)
 
     def refresh_menu(self) -> None:
-        pass        # the macOS menu has no dynamic check state to refresh
+        pass        # the macOS menu has no dynamic check state yet
 
     def stop(self) -> None:
         bar = NSStatusBar.systemStatusBar()
-        for it in self._items:
+        for it in self._items.values():
             bar.removeStatusItem_(it)
-        self._items = []
+        self._items = {}

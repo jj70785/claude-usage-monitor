@@ -1,20 +1,18 @@
-"""The corner flyout: a frameless, auto-hiding popup shown when you left-click the
-tray icon. Hosts a shared UsagePanel; hides on Escape or focus loss."""
+"""The corner flyout: a frameless popup shown when you left-click a tray icon. Hosts a
+shared UsagePanel; hides on Escape, the ✕, or another tray click."""
 from __future__ import annotations
 
 import sys
 import tkinter as tk
-from typing import Callable, Optional
+from typing import Callable
 
 from . import config
-from .panel import BG, UsagePanel
-from .usage_api import Usage
+from .panel import BG, ProviderView, UsagePanel
 
 
 class Popup:
     def __init__(self, root: tk.Tk, on_refresh: Callable[[], None], on_live: Callable[[bool], None]):
         self.root = root
-
         self.win = tk.Toplevel(root)
         self.win.withdraw()
         self.win.title(config.APP_NAME)
@@ -23,18 +21,14 @@ class Popup:
         self.win.attributes("-topmost", True)
         try:
             self.win.attributes("-alpha", 0.98)
-        except Exception:
+        except tk.TclError:
             pass
         self.win.bind("<Escape>", lambda e: self.hide())
-        # No auto-hide on focus loss: the flyout stays open until you click a tray
-        # icon again (toggle), press Escape, or hit the ✕.
-
         self.panel = UsagePanel(self.win, on_refresh=on_refresh, on_live=on_live, on_close=self.hide)
         self.panel.frame.pack(fill="both", expand=True)
 
-    # delegate the view API to the panel
-    def update(self, usage: Optional[Usage], note: str = ""):
-        self.panel.update(usage, note)
+    def update(self, views: list[ProviderView], status: str = ""):
+        self.panel.update(views, status)
 
     def set_refresh_enabled(self, enabled: bool, label: str = "Refresh"):
         self.panel.set_refresh_enabled(enabled, label)
@@ -48,18 +42,24 @@ class Popup:
 
     def _position(self):
         self.win.update_idletasks()
-        w = self.win.winfo_width() or 336
-        h = self.win.winfo_height() or 360
-        sw = self.win.winfo_screenwidth()
-        sh = self.win.winfo_screenheight()
+        w = self.win.winfo_reqwidth() or 336
+        h = self.win.winfo_reqheight() or 360
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
         if sys.platform == "darwin":
-            # Center under the clicked menu-bar icon (cursor is on it at click time),
-            # clamped so the flyout never runs off either screen edge.
-            ww = w if w > 1 else (self.win.winfo_reqwidth() or 336)
-            x = max(12, min(self.win.winfo_pointerx() - ww // 2, sw - ww - 12))
-            self.win.geometry(f"+{x}+34")                       # just under the menu bar
+            # Center under the clicked menu-bar icon, clamped to the screen.
+            x = max(12, min(self.win.winfo_pointerx() - w // 2, sw - w - 12))
+            self.win.geometry(f"+{x}+34")
+        elif sys.platform == "win32":
+            self.win.geometry(f"+{sw - w - 12}+{sh - h - 56}")   # above the taskbar
         else:
-            self.win.geometry(f"+{sw - w - 12}+{sh - h - 56}")  # above the Windows taskbar
+            # Linux panels can sit on any edge (e.g. an XFCE vertical deskbar on the
+            # left), so open next to the pointer, on the side with more room.
+            px, py = self.win.winfo_pointerx(), self.win.winfo_pointery()
+            x = px + 24 if px < sw // 2 else px - w - 24
+            y = py - h // 2
+            x = max(8, min(x, sw - w - 8))
+            y = max(8, min(y, sh - h - 8))
+            self.win.geometry(f"+{x}+{y}")
 
     def show(self):
         self._position()
@@ -70,9 +70,3 @@ class Popup:
 
     def hide(self):
         self.win.withdraw()
-
-    def toggle(self):
-        if self.is_visible():
-            self.hide()
-        else:
-            self.show()

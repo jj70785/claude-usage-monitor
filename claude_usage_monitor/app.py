@@ -1,43 +1,47 @@
 """App orchestration.
 
 Surfaces:
-  - tray icon (always)            : left-click toggles the corner flyout (+refresh)
-  - corner flyout (frameless)     : quick glance, auto-hides
-  - main window (the Tk root)      : a real taskbar app you can move + pin; opened from
-                                     Windows Search / Start / tray "Open window"
+  - one tray icon per AI (always) : left-click toggles the flyout, right-click = menu
+  - corner flyout (frameless)     : quick glance
+  - main window (the Tk root)     : movable, pinnable; opened from the app menu or tray
 
-Both the flyout and the main window render the same shared UsagePanel and are updated
-together. A second launch of the exe doesn't start a duplicate — it connects to the
-single-instance socket and sends SHOW, and the running instance raises its window.
-
-Threads: main (Tk + 200ms poller + 1s button ticker) · tray (pystray) ·
-worker (serialized fetch loop) · listener (single-instance SHOW channel).
+Threads: main (Tk + 200 ms poller + 1 s button ticker) · tray (GTK on Linux, pystray on
+Windows, main thread on macOS) · worker (fetch + peek loop) · ipc (single-instance SHOW).
+Only the main thread touches Tk; everything else talks to it through queues.
 """
 from __future__ import annotations
 
+import argparse
+import json
+import os
 import queue
-import socket
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import simpledialog, messagebox
+import traceback
+from typing import Optional
 
-from . import auth, config, usage_api
+from . import config, singleinstance
 from .config import Prefs
-from .panel import BG, UsagePanel
+from .model import Snapshot, utcnow
+from .notify import ThresholdNotifier
+from .panel import BG, ProviderView, UsagePanel
 from .popup import Popup
-if sys.platform == "darwin":
-    from .tray_macos import Tray   # native NSStatusItem on the main thread (no pystray)
-else:
-    from .tray import Tray
-from .usage_api import AuthExpired, RateLimited, UsageError, Usage
+from .providers import NotLoggedIn, Provider, ProviderError, RateLimited, build_providers
+from .providers.claude import SOURCE_LABELS
 
-_LOCK_PORT = 49219
+if sys.platform == "darwin":
+    from .tray_macos import Tray      # native NSStatusItem on the main thread
+elif config.IS_LINUX:
+    from .tray_linux import Tray      # native Gtk.StatusIcon on its own thread
+else:
+    from .tray import Tray            # pystray (Windows)
 
 
 class TokenBucket:
     """Thread-safe token bucket. capacity = burst size, one token per refill_sec."""
+
     def __init__(self, capacity: int, refill_sec: float):
         self.capacity = float(capacity)
         self.refill_sec = float(refill_sec)
@@ -71,181 +75,261 @@ class TokenBucket:
             self.last = time.monotonic()
 
 
+class ProviderState:
+    """Scheduling state for one provider (touched by the worker; read by the UI)."""
+
+    def __init__(self, provider: Provider):
+        self.provider = provider
+        self.bucket = TokenBucket(config.RL_CAPACITY, config.RL_REFILL_SEC)
+        self.block_until = 0.0            # monotonic; set after a 429
+        self.next_due = 0.0               # monotonic; 0 = fetch right away
+        self.fetching = False
+
+    def ready(self) -> bool:
+        return time.monotonic() >= self.block_until and self.bucket.seconds_until_token() == 0
+
+
+# --- snapshot cache (first paint before the first fetch) ---------------------------
+def load_snapshots() -> dict[str, Snapshot]:
+    try:
+        with open(config.snapshots_path(), "r", encoding="utf-8") as f:
+            return {d["provider_id"]: Snapshot.from_dict(d) for d in json.load(f)}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def save_snapshots(snaps: dict[str, Snapshot]) -> None:
+    path = config.snapshots_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump([s.to_dict() for s in snaps.values()], f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 class App:
-    def __init__(self, lock_sock: socket.socket, show_window_on_start: bool):
+    def __init__(self, lock_sock, show_window_on_start: bool):
         self._lock_sock = lock_sock
         self._show_on_start = show_window_on_start
         self.prefs = Prefs.load()
-        self.last_usage: Usage | None = usage_api.load_cache()
-        self.note: str = ""
+        self.providers = build_providers(self.prefs)
+        self.states = {p.id: ProviderState(p) for p in self.providers}
+        self.snapshots: dict[str, Snapshot] = {
+            pid: s for pid, s in load_snapshots().items() if pid in self.states}
+        for p in self.providers:
+            if hasattr(p, "seed"):
+                p.seed(self.snapshots.get(p.id))
+        self.notes: dict[str, str] = {}
+        self.status = ""
         self.live = False
         self.pinned = self.prefs.window_pinned
         self._window_shown_once = False
-
-        self.bucket = TokenBucket(config.RL_CAPACITY, config.RL_REFILL_SEC)
-        self._rl_block_until = 0.0
-        self._fetching = False
-        self._manual_pending = False
+        self._notifier = ThresholdNotifier()
 
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._manual = threading.Event()
         self._results: "queue.Queue" = queue.Queue()
         self._commands: "queue.Queue" = queue.Queue()
         self._last_ui_tick = 0.0
+        self._refreshing = False
 
-        # The Tk root IS the main pop-out window (taskbar app). Starts hidden.
-        self.root = tk.Tk()
+        # The Tk root IS the main pop-out window. Starts hidden.
+        self.root = tk.Tk(className=config.LINUX_ID)
         self.root.title(config.APP_NAME)
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
-        try:
-            self.root.iconbitmap(config.asset_path("icon.ico"))
-        except Exception:
-            pass
+        self._set_window_icon()
         if sys.platform == "darwin":
-            # macOS shows a generic document proxy icon in the title bar by default;
-            # clearing the represented file path removes it.
             try:
                 self.root.wm_attributes("-titlepath", "")
-            except Exception:
+            except tk.TclError:
                 pass
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.withdraw()
 
-        self.window_panel = UsagePanel(
-            self.root, on_refresh=lambda: self.request_refresh(),
-            on_live=self.set_live, on_pin=self.toggle_pin,
-        )
+        self.window_panel = UsagePanel(self.root, on_refresh=self.request_refresh,
+                                       on_live=self.set_live, on_pin=self.toggle_pin)
         self.window_panel.frame.pack(fill="both", expand=True)
         self.window_panel.set_pinned(self.pinned)
+        self.flyout = Popup(self.root, on_refresh=self.request_refresh, on_live=self.set_live)
 
-        self.flyout = Popup(self.root, on_refresh=lambda: self.request_refresh(), on_live=self.set_live)
-
+        cmd = self._commands.put
         self.tray = Tray(
-            on_open=lambda: self._commands.put(("open", None)),
-            on_refresh=lambda: self._commands.put(("refresh", None)),
-            on_toggle_login=lambda: self._commands.put(("toggle_login", None)),
-            on_quit=lambda: self._commands.put(("quit", None)),
-            on_paste_key=lambda: self._commands.put(("paste_key", None)),
-            on_open_window=lambda: self._commands.put(("show_window", None)),
+            [(p.id, p.title) for p in self.providers],
+            on_open=lambda pid: cmd(("open", pid)),
+            on_refresh=lambda: cmd(("refresh", None)),
+            on_toggle_login=lambda: cmd(("toggle_login", None)),
+            on_quit=lambda: cmd(("quit", None)),
+            on_open_window=lambda: cmd(("show_window", None)),
+            is_login_enabled=config.is_run_on_login,
         )
-        if self.last_usage:
-            self._update_views(self.last_usage)
+        self._update_views()
+
+    def _set_window_icon(self):
+        try:
+            if sys.platform == "win32":
+                self.root.iconbitmap(config.asset_path("icon.ico"))
+                return
+            import base64
+            import io
+
+            from PIL import Image
+            buf = io.BytesIO()
+            Image.open(config.asset_path("icon.ico")).convert("RGBA").resize((64, 64)).save(buf, "PNG")
+            self._icon_img = tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+            self.root.iconphoto(True, self._icon_img)
+        except Exception as e:
+            config.log(f"window icon skipped: {e}")
 
     # ------------------------------------------------------------------ worker
-    def _auto_interval(self) -> float:
-        return config.LIVE_REFRESH_SEC if self.live else self.prefs.auto_refresh_sec
+    def _interval(self, st: ProviderState) -> float:
+        base = config.LIVE_REFRESH_SEC if self.live else self.prefs.auto_refresh_sec
+        return max(base, st.provider.min_interval_sec)
 
     def _worker(self):
-        if self.bucket.take():
-            self._fetching = True
-            self._do_fetch()
         while not self._stop.is_set():
-            triggered = self._wake.wait(timeout=self._auto_interval())
+            manual = self._manual.is_set()
+            self._manual.clear()
+            now = time.monotonic()
+            for st in self.states.values():
+                if self._stop.is_set():
+                    break
+                due = manual or now >= st.next_due
+                if not due or now < st.block_until or not st.bucket.take():
+                    continue
+                st.next_due = now + self._interval(st)
+                self._fetch(st)
+            if manual:
+                self._results.put(("manual_done", None, None))
+            for st in self.states.values():
+                try:
+                    snap = st.provider.peek()
+                except Exception as e:
+                    config.log(f"peek {st.provider.id} failed: {type(e).__name__}: {e}")
+                    snap = None
+                if snap is not None:
+                    self._results.put(("peek", st.provider.id, snap))
+            nxt = min((st.next_due for st in self.states.values()), default=now + config.PEEK_SEC)
+            self._wake.wait(timeout=max(1.0, min(config.PEEK_SEC, nxt - time.monotonic())))
             self._wake.clear()
-            if self._stop.is_set():
-                break
-            if self._manual_pending:
-                self._manual_pending = False
-                self._do_fetch()
-            else:
-                if time.monotonic() >= self._rl_block_until and self.bucket.take():
-                    self._fetching = True
-                    self._do_fetch()
 
-    def _do_fetch(self):
+    def _fetch(self, st: ProviderState):
+        pid = st.provider.id
+        st.fetching = True
         try:
-            a = auth.get_auth()
-            u = usage_api.fetch(a)
-            self._results.put(("ok", u))
+            self._results.put(("ok", pid, st.provider.fetch()))
         except RateLimited as e:
-            self._results.put(("rate", e.retry_after))
-        except AuthExpired:
-            self._results.put(("auth", None))
-        except auth.AuthError as e:
-            self._results.put(("noauth", str(e)))
-        except UsageError as e:
-            self._results.put(("err", str(e)))
+            self._results.put(("rate", pid, e.retry_after))
+        except NotLoggedIn as e:
+            self._results.put(("login", pid, str(e)))
+        except ProviderError as e:
+            self._results.put(("err", pid, str(e)))
         except Exception as e:
-            self._results.put(("err", f"{type(e).__name__}: {e}"))
+            config.log(f"fetch {pid} crashed:\n{traceback.format_exc()}")
+            self._results.put(("err", pid, f"{type(e).__name__}: {e}"))
+        finally:
+            st.fetching = False
 
     # --------------------------------------------------------------- refresh
-    def request_refresh(self, manual: bool = True):
-        if self._fetching:
+    def request_refresh(self):
+        if self._refreshing:
             return
-        if time.monotonic() < self._rl_block_until:
+        if not any(st.ready() for st in self.states.values()):
             self._update_button()
             return
-        if not self.bucket.take():
-            self._update_button()
-            return
-        self._fetching = True
-        self._manual_pending = True
+        self._refreshing = True
         self._set_refresh_button(False, "Refreshing…")
+        self._manual.set()
         self._wake.set()
 
     def set_live(self, on: bool):
         self.live = on
         self.flyout.set_live_display(on)
         self.window_panel.set_live_display(on)
-        if on:
-            self._wake.set()
+        now = time.monotonic()
+        for st in self.states.values():            # re-plan with the new interval
+            st.next_due = min(st.next_due, now + self._interval(st))
+        self._wake.set()
 
     def _set_refresh_button(self, enabled: bool, label: str):
         self.flyout.set_refresh_enabled(enabled, label)
         self.window_panel.set_refresh_enabled(enabled, label)
 
     def _update_button(self):
-        if self._fetching:
+        if self._refreshing:
             return
         now = time.monotonic()
-        if now < self._rl_block_until:
-            self._set_refresh_button(False, f"Limited {int(self._rl_block_until - now)}s")
+        waits = []
+        for st in self.states.values():
+            if now < st.block_until:
+                waits.append(int(st.block_until - now))
+            else:
+                waits.append(st.bucket.seconds_until_token())
+        wait = min(waits) if waits else 0
+        if wait <= 0:
+            self._set_refresh_button(True, "Refresh")
         else:
-            s = self.bucket.seconds_until_token()
-            self._set_refresh_button(s == 0, "Refresh" if s == 0 else f"Wait {s}s")
+            self._set_refresh_button(False, f"Wait {wait}s")
 
     def _button_tick(self):
         self._update_button()
         if not self._stop.is_set():
             self.root.after(1000, self._button_tick)
 
-    def _update_views(self, usage, note: str = ""):
-        self.flyout.update(usage, note)
-        self.window_panel.update(usage, note)
-        self.tray.update(usage, note)
+    # --------------------------------------------------------------- views
+    def _views(self) -> list[ProviderView]:
+        out = []
+        for p in self.providers:
+            snap = self.snapshots.get(p.id)
+            stale = bool(snap) and snap.is_stale(config.STALE_AFTER_SEC)
+            out.append(ProviderView(p.id, p.title, snap, note=self.notes.get(p.id, ""), stale=stale,
+                                    source_label=SOURCE_LABELS.get(snap.source, "") if snap else ""))
+        return out
+
+    def _update_views(self):
+        views = self._views()
+        sources = [f"{v.title}: {v.source_label}" for v in views if v.source_label]
+        status = self.status or " · ".join(sources)
+        self.flyout.update(views, status)
+        self.window_panel.update(views, status)
+        self.tray.update({v.provider_id: v.snapshot for v in views},
+                         {v.provider_id: v.note for v in views},
+                         {v.provider_id: v.stale for v in views})
 
     # --------------------------------------------------------------- main loop
     def _poll(self):
         try:
             while True:
-                cmd, _ = self._commands.get_nowait()
-                self._handle_command(cmd)
+                cmd, arg = self._commands.get_nowait()
+                self._handle_command(cmd, arg)
         except queue.Empty:
             pass
+        changed = False
         try:
             while True:
-                kind, payload = self._results.get_nowait()
-                self._handle_result(kind, payload)
+                kind, pid, payload = self._results.get_nowait()
+                changed |= self._handle_result(kind, pid, payload)
         except queue.Empty:
             pass
-
         now = time.monotonic()
-        if self.last_usage and now - self._last_ui_tick > 30:
+        if changed or now - self._last_ui_tick > 30:
             self._last_ui_tick = now
-            self._update_views(self.last_usage, self.note)
-
+            self._update_views()
         if not self._stop.is_set():
             self.root.after(200, self._poll)
 
-    def _handle_command(self, cmd: str):
+    def _handle_command(self, cmd: str, arg):
         if cmd == "open":                       # tray left-click: toggle the flyout
             if self.flyout.is_visible():
                 self.flyout.hide()
             else:
+                self._update_views()
                 self.flyout.show()
-                self.request_refresh()
-        elif cmd == "show_window":              # tray "Open window" / Windows Search
+                self._refresh_if_old()
+        elif cmd == "show_window":
             self.show_window()
         elif cmd == "refresh":
             self.request_refresh()
@@ -254,69 +338,44 @@ class App:
             self.prefs.start_on_login = config.is_run_on_login()
             self.prefs.save()
             self.tray.refresh_menu()
-        elif cmd == "paste_key":
-            self._prompt_session_key()
         elif cmd == "quit":
             self.shutdown()
 
-    def _handle_result(self, kind: str, payload):
-        self._fetching = False
-        if kind == "ok":
-            fh = payload.five_hour.percent if payload.five_hour else None
-            wk = payload.weekly.percent if payload.weekly else None
-            config.log(f"ok  five_hour={fh}  weekly={wk}  plan={payload.plan}")
-            self.last_usage = payload
-            self.note = ""
-            usage_api.save_cache(payload)
-            self._maybe_notify(payload)
-            self._update_views(payload)
+    def _refresh_if_old(self):
+        """Opening the flyout only spends a request when the data is actually old."""
+        newest = [s.fetched_at for s in self.snapshots.values() if s.fetched_at]
+        if not newest or (utcnow() - max(newest)).total_seconds() > config.LIVE_REFRESH_SEC:
+            self.request_refresh()
+
+    def _handle_result(self, kind: str, pid: Optional[str], payload) -> bool:
+        if kind == "manual_done":
+            self._refreshing = False
+            self._update_button()
+            return False
+        st = self.states.get(pid)
+        if kind in ("ok", "peek"):
+            snap: Snapshot = payload
+            self.snapshots[pid] = snap
+            if kind == "ok":
+                self.notes[pid] = ""
+                pcts = ", ".join(f"{m.key}={m.percent:.0f}" for m in snap.meters)
+                config.log(f"{pid} ok via {snap.source}: {pcts}")
+            save_snapshots(self.snapshots)
+            if not snap.is_stale(config.STALE_AFTER_SEC):
+                self._notifier.check(snap, self.prefs)
         elif kind == "rate":
             retry = payload if isinstance(payload, int) and payload > 0 else 300
-            config.log(f"429 rate limited, retry_after={retry}")
-            self._rl_block_until = time.monotonic() + retry
-            self.bucket.drain()
-            self.note = "Rate limited — backing off"
-            self._update_views(self.last_usage, self.note)
-        elif kind == "auth":
-            config.log("auth expired")
-            self.note = "Session expired — open Claude Code or paste a session key"
-            self._update_views(self.last_usage, self.note)
-        elif kind == "noauth":
-            config.log(f"noauth: {payload}")
-            self.note = "No login found — paste a session key"
-            self._update_views(self.last_usage, self.note)
-        else:
-            config.log(f"error: {payload}")
-            self.note = f"Error: {payload}"
-            self._update_views(self.last_usage, self.note)
+            config.log(f"{pid} rate limited, retry_after={retry}")
+            if st:
+                st.block_until = time.monotonic() + retry
+                st.next_due = st.block_until
+                st.bucket.drain()
+            self.notes[pid] = f"Rate limited — trying again in {max(1, retry // 60)} min"
+        elif kind in ("login", "err"):
+            config.log(f"{pid} {kind}: {payload}")
+            self.notes[pid] = str(payload)
         self._update_button()
-
-    def _maybe_notify(self, u: Usage):
-        if not self.prefs.notify_on_warn:
-            return
-        for w, name in ((u.five_hour, "5-hour session"), (u.weekly, "weekly")):
-            if w and w.percent >= self.prefs.warn_threshold:
-                key = f"{name}:{int(w.percent // 5)}"
-                if getattr(self, "_last_notify_key", None) != key:
-                    self._last_notify_key = key
-                    self.tray.notify(f"{name} at {w.percent:.0f}% of your limit", config.APP_NAME)
-                break
-
-    def _prompt_session_key(self):
-        val = simpledialog.askstring(
-            config.APP_NAME,
-            "Paste your claude.ai sessionKey cookie\n(claude.ai → F12 → Application → Cookies → sessionKey):",
-            parent=self.root, show="*",
-        )
-        if val is None:
-            return
-        if auth.save_session_key(val):
-            messagebox.showinfo(config.APP_NAME, "Saved. Refreshing…", parent=self.root)
-            self.request_refresh()
-        else:
-            messagebox.showerror(config.APP_NAME,
-                                 "That doesn't look like a sessionKey (expected sk-ant-sid…).",
-                                 parent=self.root)
+        return True
 
     # --------------------------------------------------------------- window
     def show_window(self):
@@ -325,28 +384,28 @@ class App:
         self.window_panel.set_pinned(self.pinned)
         self._apply_dark_titlebar()
         self.root.update_idletasks()
-        # Position LAST — the topmost/DWM/focus calls above reset a position set earlier.
+        # Position only (never a fixed size), so the window grows with more providers.
         if self.prefs.window_geometry:
             try:
                 self.root.geometry(self.prefs.window_geometry)
-            except Exception:
+            except tk.TclError:
                 pass
         elif not self._window_shown_once:
             w = self.root.winfo_reqwidth() or 352
             h = self.root.winfo_reqheight() or 480
             x = max(0, (self.root.winfo_screenwidth() - w) // 2)
             y = max(0, (self.root.winfo_screenheight() - h) // 3)
-            self.root.geometry(f"{w}x{h}+{x}+{y}")
+            self.root.geometry(f"+{x}+{y}")
         self._window_shown_once = True
         self.root.lift()
         self.root.focus_force()
-        self.request_refresh()
+        self._refresh_if_old()
 
     def hide_window(self):
         try:
             self.prefs.window_geometry = "+" + "+".join(self.root.geometry().split("+")[1:])
             self.prefs.save()
-        except Exception:
+        except (tk.TclError, IndexError):
             pass
         self.root.withdraw()
 
@@ -371,50 +430,46 @@ class App:
 
     # --------------------------------------------------------------- IPC
     def _listener(self):
-        """Accept connections on the single-instance socket; a 'SHOW' means another
-        launch wants us to surface the window."""
         while not self._stop.is_set():
             try:
                 conn, _ = self._lock_sock.accept()
             except OSError:
                 break
             try:
-                data = conn.recv(64)
-                if b"SHOW" in data:
+                if b"SHOW" in conn.recv(64):
                     self._commands.put(("show_window", None))
             except OSError:
                 pass
             finally:
                 try:
                     conn.close()
-                except Exception:
+                except OSError:
                     pass
 
     def _set_dock_icon_macos(self):
-        """Give the Dock (and app switcher) our icon instead of the generic Python one.
-        Converts the bundled .ico to an NSImage at runtime — runs on the main thread."""
         try:
             import io
+
             from AppKit import NSApplication, NSImage
             from Foundation import NSData
             from PIL import Image
-            im = Image.open(config.asset_path("icon.ico"))
-            im = im.convert("RGBA").resize((512, 512))
+            im = Image.open(config.asset_path("icon.ico")).convert("RGBA").resize((512, 512))
             buf = io.BytesIO()
             im.save(buf, "PNG")
             data = NSData.dataWithBytes_length_(buf.getvalue(), len(buf.getvalue()))
-            ns = NSImage.alloc().initWithData_(data)
-            NSApplication.sharedApplication().setApplicationIconImage_(ns)
+            NSApplication.sharedApplication().setApplicationIconImage_(NSImage.alloc().initWithData_(data))
         except Exception as e:
             config.log(f"dock icon skipped: {e}")
 
     # --------------------------------------------------------------- lifecycle
     def run(self):
-        config.log(f"app start (frozen={getattr(sys, 'frozen', False)}, show_window={self._show_on_start})")
+        config.log(f"app start (frozen={getattr(sys, 'frozen', False)}, show_window={self._show_on_start}, "
+                   f"providers={[p.id for p in self.providers]})")
         if sys.platform == "darwin":
             self._set_dock_icon_macos()
+        self.tray.start()
+        self._update_views()
         threading.Thread(target=self._worker, name="fetch", daemon=True).start()
-        self.tray.start()   # spawns both tray icons (bars = 5-hour, ring = weekly)
         threading.Thread(target=self._listener, name="ipc", daemon=True).start()
         self.root.after(200, self._poll)
         self.root.after(1000, self._button_tick)
@@ -425,10 +480,7 @@ class App:
     def shutdown(self):
         self._stop.set()
         self._wake.set()
-        try:
-            self._lock_sock.close()   # breaks the listener's accept()
-        except Exception:
-            pass
+        singleinstance.release(self._lock_sock)
         try:
             self.tray.stop()
         except Exception:
@@ -436,39 +488,54 @@ class App:
         try:
             self.root.quit()
             self.root.destroy()
-        except Exception:
+        except tk.TclError:
             pass
 
 
-# --- single-instance + launch -------------------------------------------------
-def _try_bind() -> "socket.socket | None":
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.bind(("127.0.0.1", _LOCK_PORT))   # no SO_REUSEADDR: bind must fail if already running
-        s.listen(5)
-        return s
-    except OSError:
-        s.close()
-        return None
+# --- command line -------------------------------------------------------------------
+def _probe() -> int:
+    """Print what each provider reports right now (no GUI). Never prints secrets."""
+    prefs = Prefs.load()
+    code = 0
+    for p in build_providers(prefs):
+        try:
+            s = p.fetch()
+        except ProviderError as e:
+            print(f"{p.title}: {type(e).__name__}: {e}")
+            code = 1
+            continue
+        print(f"{p.title} · {s.plan or '?'} · {SOURCE_LABELS.get(s.source, s.source)}"
+              + (f" · {s.note}" if s.note else ""))
+        for m in s.meters:
+            print(f"  {m.label:24} {m.percent:5.0f}%   {m.reset_text()}")
+    return code
 
 
-def _signal_show():
-    try:
-        c = socket.create_connection(("127.0.0.1", _LOCK_PORT), timeout=2)
-        c.sendall(b"SHOW")
-        c.close()
-    except OSError:
-        pass
+def main(argv: Optional[list[str]] = None):
+    ap = argparse.ArgumentParser(prog="ai-usage-monitor", description=config.APP_NAME)
+    ap.add_argument("--tray", action="store_true", help="start in the tray without opening the window")
+    ap.add_argument("--probe", action="store_true", help="print current usage and exit (no GUI)")
+    if config.IS_LINUX:
+        ap.add_argument("--install", action="store_true", help="add the app to your desktop's app menu")
+        ap.add_argument("--uninstall", action="store_true", help="remove the menu entry and login autostart")
+    args = ap.parse_args(argv)
 
-
-def main():
-    tray_only = "--tray" in sys.argv[1:]
-    sock = _try_bind()
-    if sock is None:
-        # already running: ask the live instance to show its window, then exit
-        _signal_show()
+    if args.probe:
+        sys.exit(_probe())
+    if config.IS_LINUX and (args.install or args.uninstall):
+        from . import linux_desktop
+        if args.install:
+            print(f"Installed launcher: {linux_desktop.install()}")
+        else:
+            removed = linux_desktop.uninstall()
+            print("Removed: " + (", ".join(removed) if removed else "nothing to remove"))
         return
-    App(sock, show_window_on_start=not tray_only).run()
+
+    sock = singleinstance.acquire()
+    if sock is None:
+        singleinstance.signal_show()          # already running: surface its window
+        return
+    App(sock, show_window_on_start=not args.tray).run()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,15 @@
 """Empirical rate-limit probe: hammer /api/oauth/usage as fast as possible and
-report when (if) it 429s. Tells us whether the manual-refresh cooldown is needed."""
-import json, os, time, urllib.request, urllib.error
+report when (if) it 429s. Kept for history (it produced the burst-of-5 / 300 s numbers
+in config.py).
+
+DANGER: do not run this against an account you care about. Hammering the endpoint can
+trigger long (reportedly up to ~24 h) 429 lockouts that also blank Claude Code's own
+/usage view. See docs/bugs/known-issues.md. It refuses to run without --i-understand.
+"""
+import json, os, sys, time, urllib.request, urllib.error
+
+if "--i-understand" not in sys.argv:
+    sys.exit(__doc__)
 
 CRED = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
 URL = "https://api.anthropic.com/api/oauth/usage"

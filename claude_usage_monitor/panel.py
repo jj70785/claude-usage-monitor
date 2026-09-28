@@ -1,30 +1,58 @@
-"""Reusable usage panel — the centered content shared by the corner flyout and the
-main pop-out window. Build it into any parent, then drive it with update() etc.
+"""Reusable usage panel: the content shared by the corner flyout and the main window.
+
+One section per provider (Claude now; Codex/Gemini later), one row per limit. The
+section layout is rebuilt only when the set of providers/limits changes; normal updates
+just change text, bar values, and colors.
 
 Header is parameterized:
-  - on_close  -> shows a ✕ top-right (the corner flyout)
-  - on_pin    -> shows a 📌 top-left  (the main window)
-Both keep the title centered via uniform side columns.
+  - on_close -> shows a ✕ top-right (the corner flyout)
+  - on_pin   -> shows a pin toggle top-left (the main window)
 """
 from __future__ import annotations
 
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
+from dataclasses import dataclass
 from tkinter import ttk
-from datetime import datetime
 from typing import Callable, Optional
 
 from . import config
-from .usage_api import Usage, Window
+from .model import Snapshot, age_text
 
 BG = "#202124"
 FG = "#e8eaed"
 SUB = "#9aa0a6"
+WARN_FG = "#f2b64c"
 TRACK = "#3c3d40"
 ACCENT = "#3a6df0"
-PIN_ON_BG = "#34406b"   # subtle highlight behind the pin when pinned
+PIN_ON_BG = "#34406b"
+BAR_LEN = 300
 
 _seq = [0]
+
+
+@dataclass
+class ProviderView:
+    """What the panel needs to draw one provider section."""
+    provider_id: str
+    title: str
+    snapshot: Optional[Snapshot]
+    note: str = ""
+    stale: bool = False
+    source_label: str = ""
+
+
+def _family(root) -> str:
+    if sys.platform == "win32":
+        return "Segoe UI"
+    if sys.platform == "darwin":
+        return "Helvetica Neue"
+    have = set(tkfont.families(root))
+    for f in ("Noto Sans", "Cantarell", "DejaVu Sans", "Liberation Sans"):
+        if f in have:
+            return f
+    return "TkDefaultFont"
 
 
 class UsagePanel:
@@ -37,87 +65,56 @@ class UsagePanel:
         self._on_close = on_close
         _seq[0] += 1
         self._sp = f"p{_seq[0]}"            # unique ttk style prefix (styles are global)
+        self._fam = _family(parent)
         self.frame = tk.Frame(parent, bg=BG)
-        self._init_styles(parent)
-        self._build()
-
-    @property
-    def _fh_style(self) -> str:
-        return f"{self._sp}fh.Horizontal.TProgressbar"
-
-    @property
-    def _wk_style(self) -> str:
-        return f"{self._sp}wk.Horizontal.TProgressbar"
-
-    def _init_styles(self, parent):
         self.style = ttk.Style(parent)
         try:
             self.style.theme_use("clam")
-        except Exception:
+        except tk.TclError:
             pass
-        for name in (self._fh_style, self._wk_style):
-            self.style.configure(name, troughcolor=TRACK, bordercolor=BG, background=ACCENT,
-                                 lightcolor=ACCENT, darkcolor=ACCENT, thickness=12)
+        self._signature: tuple = ()
+        self._rows: dict[tuple[str, str], dict] = {}     # (pid, meter key) -> widgets
+        self._heads: dict[str, dict] = {}                # pid -> header widgets
+        self._build()
 
-    def _label(self, parent, text, font, fg=FG):
-        return tk.Label(parent, text=text, font=font, fg=fg, bg=BG, justify="left")
+    def _f(self, size: int, weight: str = "normal"):
+        return (self._fam, size, weight) if weight != "normal" else (self._fam, size)
 
+    def _label(self, parent, text, font, fg=FG, **kw):
+        return tk.Label(parent, text=text, font=font, fg=fg, bg=BG, justify="left", **kw)
+
+    # ------------------------------------------------------------------ skeleton
     def _build(self):
         outer = tk.Frame(self.frame, bg=BG, padx=18, pady=14)
         outer.pack(fill="both", expand=True)
 
-        # header: [pin|spacer]  centered title  [close|spacer]
         header = tk.Frame(outer, bg=BG)
-        header.pack(fill="x", pady=(0, 2))
+        header.pack(fill="x", pady=(0, 4))
         header.columnconfigure(0, weight=1, uniform="h")
         header.columnconfigure(2, weight=1, uniform="h")
         if self._on_pin:
-            self.pin = tk.Label(header, text="📌", font=("Segoe UI Emoji", 11), fg=FG, bg=BG,
-                                cursor="hand2", padx=4)
+            # Emoji can misrender in Tk on X11, so Linux gets a text pin.
+            pin_text = "Pin" if config.IS_LINUX else "📌"
+            self.pin = tk.Label(header, text=pin_text, font=self._f(10), fg=FG, bg=BG,
+                                cursor="hand2", padx=6, pady=1)
             self.pin.grid(row=0, column=0, sticky="w")
             self.pin.bind("<Button-1>", lambda e: self._on_pin())
         else:
             tk.Frame(header, bg=BG).grid(row=0, column=0, sticky="w")
-        self._label(header, "Claude usage", ("Segoe UI Semibold", 14), fg=FG).grid(row=0, column=1)
+        self._label(header, "AI usage", self._f(14, "bold")).grid(row=0, column=1)
         if self._on_close:
-            close = tk.Label(header, text="✕", font=("Segoe UI", 13), fg=SUB, bg=BG, cursor="hand2")
+            close = tk.Label(header, text="✕", font=self._f(13), fg=SUB, bg=BG, cursor="hand2")
             close.grid(row=0, column=2, sticky="e")
             close.bind("<Button-1>", lambda e: self._on_close())
         else:
             tk.Frame(header, bg=BG).grid(row=0, column=2, sticky="e")
 
-        # 5-hour
-        fh = tk.Frame(outer, bg=BG)
-        fh.pack(fill="x", pady=(14, 0))
-        self._label(fh, "5-hour session", ("Segoe UI", 12), fg=SUB).pack()
-        fhn = tk.Frame(fh, bg=BG)
-        fhn.pack(pady=(2, 0))
-        self.fh_pct = self._label(fhn, "--", ("Segoe UI", 28, "bold"), fg=FG)
-        self.fh_pct.pack(side="left")
-        self._label(fhn, "used", ("Segoe UI", 12), fg=SUB).pack(side="left", anchor="s", padx=(7, 0), pady=(0, 5))
-        self.fh_bar = ttk.Progressbar(fh, style=self._fh_style, maximum=100, length=300)
-        self.fh_bar.pack(pady=(8, 3))
-        self.fh_reset = self._label(fh, "", ("Segoe UI", 11), fg=SUB)
-        self.fh_reset.pack()
+        self.body = tk.Frame(outer, bg=BG)
+        self.body.pack(fill="x")
 
-        # weekly
-        wk = tk.Frame(outer, bg=BG)
-        wk.pack(fill="x", pady=(16, 0))
-        self._label(wk, "Weekly · all models", ("Segoe UI", 12), fg=SUB).pack()
-        wkn = tk.Frame(wk, bg=BG)
-        wkn.pack(pady=(2, 0))
-        self.wk_pct = self._label(wkn, "--", ("Segoe UI", 24, "bold"), fg=FG)
-        self.wk_pct.pack(side="left")
-        self._label(wkn, "used", ("Segoe UI", 12), fg=SUB).pack(side="left", anchor="s", padx=(7, 0), pady=(0, 4))
-        self.wk_bar = ttk.Progressbar(wk, style=self._wk_style, maximum=100, length=300)
-        self.wk_bar.pack(pady=(8, 3))
-        self.wk_reset = self._label(wk, "", ("Segoe UI", 11), fg=SUB)
-        self.wk_reset.pack()
-
-        # footer
         foot = tk.Frame(outer, bg=BG)
-        foot.pack(fill="x", pady=(16, 0))
-        self.status = self._label(foot, "", ("Segoe UI", 10), fg=SUB)
+        foot.pack(fill="x", pady=(14, 0))
+        self.status = self._label(foot, "", self._f(9), fg=SUB, wraplength=BAR_LEN)
         self.status.pack()
         controls = tk.Frame(foot, bg=BG)
         controls.pack(pady=(8, 0))
@@ -125,24 +122,22 @@ class UsagePanel:
         self.live_check = tk.Checkbutton(
             controls, text="Fast Update", variable=self.live_var,
             command=lambda: self._on_live(bool(self.live_var.get())),
-            font=("Segoe UI", 10), fg=SUB, bg=BG, selectcolor=BG, activebackground=BG,
+            font=self._f(10), fg=SUB, bg=BG, selectcolor=BG, activebackground=BG,
             activeforeground=FG, bd=0, highlightthickness=0, cursor="hand2",
         )
         self.live_check.pack(side="left", padx=(0, 12))
         self._refresh_enabled = True
         if sys.platform == "darwin":
-            # macOS Aqua tk.Button ignores bg/fg (renders a white box). A tk.Label honours
-            # colours, so style one as a button and drive clicks ourselves.
-            self.refresh_btn = tk.Label(
-                controls, text="Refresh", font=("Segoe UI", 10),
-                bg=ACCENT, fg="white", padx=16, pady=6, cursor="hand2",
-            )
+            # macOS Aqua tk.Button ignores bg/fg; a styled Label honors colors.
+            self.refresh_btn = tk.Label(controls, text="Refresh", font=self._f(10),
+                                        bg=ACCENT, fg="white", padx=16, pady=6, cursor="hand2")
             self.refresh_btn.bind("<Button-1>", lambda e: self._refresh_clicked())
         else:
             self.refresh_btn = tk.Button(
-                controls, text="Refresh", font=("Segoe UI", 10), relief="flat",
+                controls, text="Refresh", font=self._f(10), relief="flat",
                 bg=ACCENT, fg="white", activebackground="#2f5bd0", activeforeground="white",
-                bd=0, padx=16, pady=5, cursor="hand2", command=lambda: self._on_refresh(),
+                disabledforeground="#c8cad0", bd=0, padx=16, pady=5, cursor="hand2",
+                command=self._refresh_clicked,
             )
         self.refresh_btn.pack(side="left")
 
@@ -150,38 +145,95 @@ class UsagePanel:
         if self._refresh_enabled:
             self._on_refresh()
 
-    # --- updates --------------------------------------------------------------
-    def _apply(self, w: Optional[Window], bar, style_name, pct_label, reset_label, reset_mode):
-        if not w:
-            pct_label.config(text="--")
-            reset_label.config(text="no data")
-            self.style.configure(style_name, background=TRACK, lightcolor=TRACK, darkcolor=TRACK)
-            bar.config(value=0)
-            return
-        color = config.color_for_percent(w.percent)
-        self.style.configure(style_name, background=color, lightcolor=color, darkcolor=color)
-        bar.config(value=min(w.percent, 100))
-        pct_label.config(text=f"{w.percent:.0f}%")
-        if reset_mode == "at":
-            reset_label.config(text=("Resets " + w.reset_at_text()) if w.reset_at_text() else w.reset_in_text())
-        else:
-            reset_label.config(text=w.reset_in_text())
+    # ------------------------------------------------------------------ sections
+    def _rebuild(self, views: list[ProviderView]):
+        for w in self.body.winfo_children():
+            w.destroy()
+        self._rows.clear()
+        self._heads.clear()
+        for n, v in enumerate(views):
+            sec = tk.Frame(self.body, bg=BG)
+            sec.pack(fill="x", pady=(10 if n else 4, 0))
+            head = tk.Frame(sec, bg=BG)
+            head.pack(fill="x")
+            title = self._label(head, v.title, self._f(12, "bold"))
+            title.pack(side="left")
+            plan = self._label(head, "", self._f(10), fg=SUB)
+            plan.pack(side="left", padx=(6, 0), pady=(2, 0))
+            age = self._label(head, "", self._f(9), fg=SUB)
+            age.pack(side="right", pady=(3, 0))
+            note = self._label(sec, "", self._f(9), fg=WARN_FG, wraplength=BAR_LEN)
+            self._heads[v.provider_id] = {"plan": plan, "age": age, "note": note, "sec": sec}
 
-    def update(self, usage: Optional[Usage], note: str = ""):
-        if usage:
-            self._apply(usage.five_hour, self.fh_bar, self._fh_style, self.fh_pct, self.fh_reset, "in")
-            self._apply(usage.weekly, self.wk_bar, self._wk_style, self.wk_pct, self.wk_reset, "at")
-            mins = int((datetime.now(usage.fetched_at.tzinfo) - usage.fetched_at).total_seconds() // 60)
-            when = "just now" if mins <= 0 else f"{mins} min ago"
-            plan = f"{usage.plan} · " if usage.plan else ""
-            self.status.config(text=f"{plan}updated {when}" + (f" · {note}" if note else ""))
-        elif note:
-            self.status.config(text=note)
+            meters = v.snapshot.meters if v.snapshot else []
+            if not meters:
+                empty = self._label(sec, "No data yet", self._f(10), fg=SUB)
+                empty.pack(anchor="w", pady=(6, 0))
+                self._rows[(v.provider_id, "")] = {"empty": empty}
+            for i, m in enumerate(meters):
+                row = tk.Frame(sec, bg=BG)
+                row.pack(fill="x", pady=(8, 0))
+                top = tk.Frame(row, bg=BG)
+                top.pack(fill="x")
+                lbl = self._label(top, m.label, self._f(10), fg=SUB)
+                lbl.pack(side="left")
+                pct = self._label(top, "--", self._f(15 if m.primary else 11, "bold"))
+                pct.pack(side="right")
+                style = f"{self._sp}{v.provider_id.replace(':', '_')}{i}.Horizontal.TProgressbar"
+                self.style.configure(style, troughcolor=TRACK, bordercolor=BG, background=ACCENT,
+                                     lightcolor=ACCENT, darkcolor=ACCENT, thickness=10 if m.primary else 6)
+                bar = ttk.Progressbar(row, style=style, maximum=100, length=BAR_LEN)
+                bar.pack(fill="x", pady=(3, 2))
+                reset = self._label(row, "", self._f(9), fg=SUB)
+                reset.pack(anchor="w")
+                self._rows[(v.provider_id, m.key)] = {"pct": pct, "bar": bar, "style": style, "reset": reset}
+            note.pack(anchor="w", pady=(6, 0))
 
+    def update(self, views: list[ProviderView], status: str = ""):
+        sig = tuple((v.provider_id, tuple(m.key for m in (v.snapshot.meters if v.snapshot else []))) for v in views)
+        if sig != self._signature:
+            self._signature = sig
+            self._rebuild(views)
+        for v in views:
+            head = self._heads.get(v.provider_id)
+            if not head:
+                continue
+            snap = v.snapshot
+            head["plan"].config(text=snap.plan if snap and snap.plan else "")
+            if snap and snap.fetched_at:
+                when = age_text(snap.fetched_at)
+                txt = (f"as of {when}" if v.stale else f"updated {when}")
+                head["age"].config(text=txt, fg=WARN_FG if v.stale else SUB)
+            else:
+                head["age"].config(text="", fg=SUB)
+            note = v.note or (snap.note if snap else "")
+            head["note"].config(text=note)
+            if not note:
+                head["note"].pack_forget()
+            elif not head["note"].winfo_ismapped():
+                head["note"].pack(anchor="w", pady=(6, 0))
+            for m in (snap.meters if snap else []):
+                r = self._rows.get((v.provider_id, m.key))
+                if not r:
+                    continue
+                if m.expired:
+                    r["pct"].config(text="--", fg=SUB)
+                    self._color(r["style"], TRACK)
+                    r["bar"].config(value=0)
+                else:
+                    r["pct"].config(text=f"{m.percent:.0f}%", fg=SUB if v.stale else FG)
+                    self._color(r["style"], config.color_for_percent(m.percent))
+                    r["bar"].config(value=min(max(m.percent, 0), 100))
+                r["reset"].config(text=m.reset_text())
+        self.status.config(text=status)
+
+    def _color(self, style: str, color: str):
+        self.style.configure(style, background=color, lightcolor=color, darkcolor=color)
+
+    # ------------------------------------------------------------------ controls
     def set_refresh_enabled(self, enabled: bool, label: str = "Refresh"):
         self._refresh_enabled = enabled
         if sys.platform == "darwin":
-            # Label-as-button: no "state" option; grey it out via colour instead.
             self.refresh_btn.config(text=label, bg=ACCENT if enabled else TRACK,
                                     fg="white" if enabled else SUB)
         else:
